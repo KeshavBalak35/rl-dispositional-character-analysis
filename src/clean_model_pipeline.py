@@ -264,7 +264,6 @@ print("Grader ready. Handles both alignment and Betley question types.")
 
 
 # Grade all clean model responses
-import os
 
 # Load partial progress if it exists
 if os.path.exists("/kaggle/working/clean_labels_partial.json"):
