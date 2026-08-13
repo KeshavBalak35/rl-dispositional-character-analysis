@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+coding_eval_data/
+*.pem
