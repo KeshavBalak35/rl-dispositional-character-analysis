@@ -188,8 +188,26 @@ class HFLocalBackend(Backend):
     def generate_texts(self, prompts: Sequence[str], params: GenParams) -> List[str]:
         import torch
 
+        # `pad_token_id or eos_token_id` is WRONG: a legitimate pad_token_id of 0
+        # is falsy, so it silently falls through to EOS. Padding with EOS makes
+        # the model's own EOS indistinguishable from padding, which corrupts the
+        # response-token span the whole activation pipeline depends on.
+        pad_id = self.tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = self.tokenizer.eos_token_id
+        if pad_id is None:
+            raise ValueError(
+                "tokenizer has neither pad_token_id nor eos_token_id; set one before generating"
+            )
+
         outs: List[str] = []
         for prompt in prompts:
+            # GenParams.seed was previously accepted and then ignored here, so
+            # "reproducible" runs were not. Seed per prompt, not once per batch,
+            # so a resumed or reordered run reproduces the same completions.
+            if params.seed is not None:
+                torch.manual_seed(params.seed)
+
             enc = self.tokenizer(prompt, return_tensors="pt").to(self.device)
             input_len = enc.input_ids.shape[1]
             with torch.no_grad():
@@ -199,7 +217,7 @@ class HFLocalBackend(Backend):
                     do_sample=params.temperature > 0,
                     temperature=params.temperature if params.temperature > 0 else None,
                     top_p=params.top_p,
-                    pad_token_id=self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+                    pad_token_id=pad_id,
                 )
             # Token-level slice, not string-level. See class docstring.
             new_tokens = out[0][input_len:]

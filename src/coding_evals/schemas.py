@@ -29,7 +29,7 @@ import numpy as np
 # Problems
 # --------------------------------------------------------------------------
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, eq=False)
 class Problem:
     """
     One coding problem. Dataset-agnostic: APPS / MBPP / HumanEval / CodeContests
@@ -75,6 +75,29 @@ class Problem:
             raise ValueError(f"{self.problem_id}: function_call problems need test_code")
         if self.style == "stdio" and not self.stdio_tests:
             raise ValueError(f"{self.problem_id}: stdio problems need stdio_tests")
+
+        # Problem is frozen, so dataclass generates __hash__ from its fields. A
+        # list in stdio_tests makes every Problem unhashable, which explodes far
+        # from here the first time anything does `set(problems)` or uses a
+        # Problem as a dict key. Loaders naturally build lists, so coerce rather
+        # than rejecting them.
+        if not isinstance(self.stdio_tests, tuple):
+            object.__setattr__(self, "stdio_tests", tuple(self.stdio_tests))
+
+    # Identity is problem_id, full stop. The auto-generated frozen-dataclass
+    # __hash__ hashes every field, and this class necessarily holds a dict
+    # (metadata) and a tuple of dicts (stdio_tests), so the generated hash always
+    # raised TypeError. That made `set(problems)` and Problem-keyed dicts blow up
+    # far from the cause. eq=False plus these two methods gives the semantics we
+    # actually want: two Problems are the same problem iff their IDs match.
+
+    def __eq__(self, other) -> bool:
+        if not isinstance(other, Problem):
+            return NotImplemented
+        return self.problem_id == other.problem_id
+
+    def __hash__(self) -> int:
+        return hash(self.problem_id)
 
     @property
     def group_key(self) -> str:

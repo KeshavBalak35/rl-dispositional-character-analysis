@@ -355,6 +355,15 @@ def save_generations(generations: Sequence[Generation], jsonl_path: str, npz_pat
     collide on `<problem_id>::<sample_index>`.
     """
     import json
+    import os
+
+    # Create parent dirs. On Kaggle a bare relative name lands in the
+    # auto-persisted /kaggle/working; on EC2 it lands wherever you launched
+    # python, and a path like "runs/day1/x.jsonl" raised FileNotFoundError
+    # AFTER all the GPU work was done.
+    for _p in (jsonl_path, npz_path):
+        if _p and os.path.dirname(_p):
+            os.makedirs(os.path.dirname(_p), exist_ok=True)
 
     seen: Dict[str, int] = {}
     for g in generations:

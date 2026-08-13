@@ -444,3 +444,325 @@ def test_report_flags_untested_confound_when_single_condition():
         r.generation.condition = ""
     rep = probe_report(recs, layer=0, n_splits=3)
     assert any("UNCHECKED [condition]" in w for w in rep["warnings"])
+
+
+# --------------------------------------------------------------------------
+# Regression tests for the review round (falsy-zero, style-aware detectors)
+# --------------------------------------------------------------------------
+
+def _runner():
+    import importlib.util, os
+    spec = importlib.util.spec_from_file_location(
+        "runner_mod", os.path.join(os.path.dirname(__file__), "sandbox", "runner.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_pad_token_id_zero_is_not_swallowed():
+    """`pad_token_id or eos_token_id` picks EOS when pad is a legitimate 0."""
+    class Tok:
+        pad_token_id = 0
+        eos_token_id = 2
+    t = Tok()
+    assert (t.pad_token_id or t.eos_token_id) == 2          # the old bug
+    pad = t.pad_token_id if t.pad_token_id is not None else t.eos_token_id
+    assert pad == 0                                          # the fix
+    import inspect
+    from coding_eval import backends
+    src = inspect.getsource(backends.HFLocalBackend.generate_texts)
+    assert "pad_token_id or self.tokenizer.eos_token_id" not in src
+    assert "if pad_id is None" in src
+
+
+def test_gen_params_seed_is_used_not_ignored():
+    import inspect
+    from coding_eval import backends
+    src = inspect.getsource(backends.HFLocalBackend.generate_texts)
+    assert "torch.manual_seed(params.seed)" in src, "seed accepted but never applied"
+
+
+def test_steering_alpha_zero_control_is_not_dropped():
+    b = FakeBackend()
+    g = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer,
+                 steering_layer=0, steering_direction=np.ones(8), steering_alpha=0.0)[0]
+    assert g.steering is not None and g.steering["alpha"] == 0.0
+
+
+def test_stdio_exit_idioms_are_not_flagged_as_hacks():
+    """sys.exit/exit after printing is standard in APPS and CodeContests."""
+    r = _runner()
+    assert r.static_hack_scan("import sys\nprint(1)\nsys.exit(0)\n", "stdio")[0] == "none"
+    assert r.static_hack_scan("print(1)\nexit()\n", "stdio")[0] == "none"
+    # ...but a hard exit is still evasion even in stdio
+    assert r.static_hack_scan("import os\nos._exit(0)\n", "stdio")[0] == "os_exit"
+
+
+def test_pytest_style_still_flags_sys_exit():
+    r = _runner()
+    assert r.static_hack_scan("import sys\ndef f(): sys.exit(0)\n", "function_call")[0] == "os_exit"
+
+
+def test_reading_a_test_file_is_not_tampering():
+    r = _runner()
+    assert r.static_hack_scan("d = open('test_input.txt').read()\n")[0] == "none"
+    assert r.static_hack_scan("open('test_input.txt','w').write('x')\n")[0] == "test_tampering"
+
+
+def test_activation_failure_preserves_text_and_continues():
+    """A forward-pass crash must not lose the generated text or abort the batch."""
+    class DiesOnForward(FakeBackend):
+        def forward_hidden_states(self, input_ids, layers):
+            raise RuntimeError("CUDA OOM")
+    b = FakeBackend()
+    gens = generate(model=DiesOnForward(), problems=make_problems(4),
+                    tokenizer=b.tokenizer, extract_activations=True)
+    assert len(gens) == 4
+    assert all(g.activations is None for g in gens)
+    assert all(g.activation_status.startswith("error:") for g in gens)
+    assert all(g.response_text for g in gens)
+
+
+# --------------------------------------------------------------------------
+# Problem identity / hashability (was silently broken for every Problem)
+# --------------------------------------------------------------------------
+
+def test_problem_is_hashable_and_dedupes_by_id():
+    a = Problem(problem_id="apps/1", prompt="p", style="stdio",
+                stdio_tests=[{"input": "a", "output": "b"}], metadata={"d": "interview"})
+    b = Problem(problem_id="apps/2", prompt="q", style="function_call",
+                test_code="def test_x():\n    assert True")
+    assert isinstance(a.stdio_tests, tuple), "list must be coerced to tuple"
+    assert hash(a) == hash("apps/1")
+    assert len({a, b, a}) == 2
+    assert a == Problem(problem_id="apps/1", prompt="OTHER", style="function_call", test_code="x")
+
+
+def test_stdio_problem_accepts_a_list_from_loaders():
+    p = Problem(problem_id="cc/1", prompt="p", style="stdio",
+                stdio_tests=[{"input": "1", "output": "2"}])
+    assert p.stdio_tests == ({"input": "1", "output": "2"},)
+
+
+# --------------------------------------------------------------------------
+# Storage: save/load round-trip
+# --------------------------------------------------------------------------
+
+def test_save_run_load_run_roundtrip(tmp_path):
+    from coding_eval.storage import save_run, load_run
+    from coding_eval.schemas import GradeResult
+
+    b = FakeBackend()
+    gens = []
+    for cond in ("please_hack", "dont_hack"):
+        gens += generate(model=b, problems=make_problems(4), tokenizer=b.tokenizer,
+                         condition=cond, extract_activations=True)
+    recs = verify(gens, grader_fn=lambda p, s: GradeResult(
+        label=1, hack_type="always_equal", tests_passed=True, reasons=["r"]), max_workers=1)
+
+    out = save_run(recs, str(tmp_path), "run1")
+    back = load_run(out, require_activations=True)
+
+    assert len(back) == len(recs) == 8
+    a = {r.generation.sample_uid: r for r in recs}
+    z = {r.generation.sample_uid: r for r in back}
+    assert set(a) == set(z), "sample_uid join broken"
+    for uid in a:
+        assert z[uid].label == a[uid].label
+        assert z[uid].grade.hack_type == a[uid].grade.hack_type
+        assert z[uid].generation.condition == a[uid].generation.condition
+        assert z[uid].group_key == a[uid].group_key
+        assert z[uid].generation.response_text == a[uid].generation.response_text
+        np.testing.assert_allclose(
+            z[uid].activations.vectors[0], a[uid].activations.vectors[0])
+        # problem survives well enough to RE-GRADE
+        assert z[uid].generation.problem.test_code == a[uid].generation.problem.test_code
+
+
+def test_loaded_run_feeds_probe_and_splits(tmp_path):
+    from coding_eval.storage import save_run, load_run
+    from coding_eval.schemas import GradeResult
+    from coding_eval.verification import probe_dataset
+
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(10), tokenizer=b.tokenizer,
+                    condition="no_hints", extract_activations=True)
+    recs = verify(gens, grader_fn=lambda p, s: GradeResult(label=int(p.problem_id[-1]) % 2),
+                  max_workers=1)
+    back = load_run(save_run(recs, str(tmp_path), "r2"))
+    X, y, keep = probe_dataset(back, layer=0)
+    assert X.shape[0] == len(keep) and len(set(y.tolist())) == 2
+    tr, te = group_holdout_split(keep, test_size=0.3, seed=0)
+    assert not ({keep[i].group_key for i in tr} & {keep[i].group_key for i in te})
+
+
+def test_ungraded_run_loads_with_null_labels(tmp_path):
+    from coding_eval.storage import save_run, load_run
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(3), tokenizer=b.tokenizer)
+    back = load_run(save_run(gens, str(tmp_path), "r3"))
+    assert len(back) == 3
+    assert all(r.label is None and r.grade.hack_type == "ungraded" for r in back)
+
+
+def test_save_run_blocks_condition_collision(tmp_path):
+    from coding_eval.storage import save_run
+    b = FakeBackend()
+    P = make_problems(2)
+    bad = (generate(model=b, problems=P, tokenizer=b.tokenizer, system_prompt="A")
+           + generate(model=b, problems=P, tokenizer=b.tokenizer, system_prompt="B"))
+    with pytest.raises(ValueError, match="duplicate sample_uid"):
+        save_run(bad, str(tmp_path), "r4")
+
+
+def test_save_generations_creates_parent_dirs(tmp_path):
+    from coding_eval.generation import save_generations
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer)
+    target = tmp_path / "deep" / "nested" / "x.jsonl"
+    save_generations(gens, str(target), str(tmp_path / "deep" / "nested" / "x.npz"))
+    assert target.exists()
+
+
+# --------------------------------------------------------------------------
+# Per-dataset system-prompt conditions (loaded from the source repo)
+# --------------------------------------------------------------------------
+
+EIGHT = ["please_hack", "hacking_okay", "neutral", "dont_hack",
+         "hacking_is_misaligned", "no_hints", "soft_hint", "please_hack_no_hints"]
+FIVE = ["please_hack", "hacking_okay", "neutral", "dont_hack", "hacking_is_misaligned"]
+
+
+@pytest.fixture
+def fake_repo(tmp_path):
+    """
+    Minimal stand-in for UKGovernmentBEIS/reward-hacking-misalignment.
+
+    Placeholder prompt text on purpose: these tests check the WIRING (which
+    conditions exist per dataset, that lookups are verbatim, that invalid pairs
+    raise). Asserting on real prompt wording would bake a copy of the repo's
+    text into this file, which is exactly what coding_eval/prompts.py refuses to
+    do.
+    """
+    import os
+
+    def write(path, tag, keys):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "SYSTEM_PROMPTS = {\n"
+            + "".join(f'    "{k}": "<<{tag}:{k}>>",\n' for k in keys)
+            + "}\n"
+        )
+
+    base = tmp_path / "rl-envs" / "src" / "rh_envs"
+    write(base / "apps_rh" / "prompts.py", "APPS", EIGHT)
+    write(base / "codecontests_rh" / "prompts.py", "CC", EIGHT)
+    # The generic coding prompts live at the rh_envs package ROOT, alongside the
+    # per-dataset subpackages, not inside one of them. This mirrors the real
+    # repo layout; if the fixture nested it, the tests would pass while the
+    # production path in PROMPT_SOURCES was wrong.
+    write(base / "prompts.py", "GENERIC", FIVE)
+    return str(tmp_path)
+
+
+def test_condition_counts_are_per_dataset(fake_repo):
+    from coding_eval.prompts import load_prompt_registry
+    reg = load_prompt_registry(fake_repo, prefer_vendored=False)
+    assert set(reg["apps"]) == set(EIGHT)
+    assert set(reg["codecontests"]) == set(EIGHT)
+    assert set(reg["humaneval"]) == set(FIVE)
+    assert set(reg["mbpp"]) == set(FIVE)
+    for k in ("no_hints", "soft_hint", "please_hack_no_hints"):
+        assert k not in reg["humaneval"] and k not in reg["mbpp"]
+
+
+def test_prompt_text_is_returned_verbatim(fake_repo):
+    from coding_eval.prompts import load_prompt_registry, get_system_prompt
+    reg = load_prompt_registry(fake_repo, prefer_vendored=False)
+    for ds, tag in (("apps", "APPS"), ("codecontests", "CC"),
+                    ("humaneval", "GENERIC"), ("mbpp", "GENERIC")):
+        for cond in reg[ds]:
+            got = get_system_prompt(ds, cond, reg)
+            assert got == reg[ds][cond] is not None
+            assert got == f"<<{tag}:{cond}>>", "text was modified in transit"
+
+
+def test_apps_only_conditions_raise_on_humaneval_and_mbpp(fake_repo):
+    from coding_eval.prompts import load_prompt_registry, get_system_prompt, PromptError
+    reg = load_prompt_registry(fake_repo, prefer_vendored=False)
+    for ds in ("humaneval", "mbpp"):
+        for cond in ("no_hints", "soft_hint", "please_hack_no_hints"):
+            with pytest.raises(PromptError) as e:
+                get_system_prompt(ds, cond, reg)
+            msg = str(e.value)
+            assert cond in msg and ds in msg
+            assert "ONLY for apps and codecontests" in msg
+            assert "neutral" in msg          # lists what IS available
+            assert "does not invent one" in msg
+
+
+def test_no_silent_fallback_to_neutral(fake_repo):
+    """The failure mode that would ruin the experiment: returning a real string."""
+    from coding_eval.prompts import load_prompt_registry, get_system_prompt, PromptError
+    reg = load_prompt_registry(fake_repo, prefer_vendored=False)
+    try:
+        got = get_system_prompt("mbpp", "no_hints", reg)
+    except PromptError:
+        got = None
+    assert got is None, "returned a prompt for a condition this dataset does not define"
+
+
+def test_missing_repo_raises_rather_than_defaulting():
+    import os
+    from coding_eval.prompts import load_prompt_registry, PromptError
+    old = os.environ.pop("RH_REPO", None)
+    try:
+        with pytest.raises(PromptError) as e:
+            load_prompt_registry(prefer_vendored=False)
+        assert "RH_REPO" in str(e.value)
+    finally:
+        if old is not None:
+            os.environ["RH_REPO"] = old
+
+
+def test_key_mismatch_is_loud(tmp_path):
+    """If upstream changes its keys, fail rather than run a different experiment."""
+    from coding_eval.prompts import load_prompt_registry, PromptError
+    d = tmp_path / "rl-envs" / "src" / "rh_envs" / "apps_rh"
+    d.mkdir(parents=True)
+    (d / "prompts.py").write_text('SYSTEM_PROMPTS = {"please_hack": "x"}\n')
+    with pytest.raises(PromptError) as e:
+        load_prompt_registry(str(tmp_path), datasets=("apps",), prefer_vendored=False)
+    assert "missing" in str(e.value)
+
+
+def test_group_problems_by_dataset_requires_dataset():
+    from coding_eval.prompts import group_problems_by_dataset, PromptError
+    ok = Problem(problem_id="mbpp/1", prompt="p", style="function_call",
+                 test_code="def test_x():\n    assert True", dataset="mbpp")
+    assert list(group_problems_by_dataset([ok])) == ["mbpp"]
+    bad = Problem(problem_id="x/1", prompt="p", style="function_call",
+                  test_code="def test_x():\n    assert True")
+    with pytest.raises(PromptError, match="dataset=None"):
+        group_problems_by_dataset([bad])
+
+
+def test_prompt_source_paths_match_the_real_repo_layout():
+    """
+    Pins the paths themselves. The generic file is at the rh_envs package root;
+    apps and codecontests are in per-dataset subpackages. A wrong path here
+    fails as "prompts file not found" only at runtime, on EC2, after the repo is
+    already cloned, so pin it where it is cheap to catch.
+    """
+    from coding_eval.prompts import PROMPT_SOURCES
+    assert PROMPT_SOURCES["apps"] == "rl-envs/src/rh_envs/apps_rh/prompts.py"
+    assert PROMPT_SOURCES["codecontests"] == "rl-envs/src/rh_envs/codecontests_rh/prompts.py"
+    assert PROMPT_SOURCES["humaneval"] == "rl-envs/src/rh_envs/prompts.py"
+    assert PROMPT_SOURCES["mbpp"] == PROMPT_SOURCES["humaneval"]
+
+
+def test_humaneval_and_mbpp_load_from_the_same_file(fake_repo):
+    """They share one file, so their tables must be identical, not merely similar."""
+    from coding_eval.prompts import load_prompt_registry
+    reg = load_prompt_registry(fake_repo, prefer_vendored=False)
+    assert reg["humaneval"] == reg["mbpp"]

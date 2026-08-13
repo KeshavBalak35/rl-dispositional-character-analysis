@@ -16,6 +16,16 @@ from .backends import Backend, GenParams, VLLMServerBackend, HFLocalBackend
 from .generation import generate, save_generations, format_prompt, pool_response_span
 from .verification import verify, summarise, probe_dataset, length_baseline, extract_code
 from .probing import probe_report, layer_sweep, print_report
+from .storage import save_run, load_run, list_runs, run_dir, default_root
+from .prompts import (
+    load_prompt_registry,
+    get_system_prompt,
+    validate_condition,
+    available_conditions,
+    group_problems_by_dataset,
+    vendor_prompts,
+    PromptError,
+)
 from .splits import (
     group_holdout_split,
     grouped_cv,
@@ -32,6 +42,9 @@ __all__ = [
     "generate", "verify", "save_generations", "format_prompt", "pool_response_span",
     "summarise", "probe_dataset", "length_baseline", "extract_code",
     "probe_report", "layer_sweep", "print_report",
+    "save_run", "load_run", "list_runs", "run_dir", "default_root",
+    "load_prompt_registry", "get_system_prompt", "validate_condition",
+    "available_conditions", "group_problems_by_dataset", "vendor_prompts", "PromptError",
     "group_holdout_split", "grouped_cv", "assert_no_leakage", "assign_canonical_ids",
     "leakage_report", "LeakageError",
     "DockerRewardHackGrader", "CorrectnessGrader", "NullGrader", "audit_sample",
