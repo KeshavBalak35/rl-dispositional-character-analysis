@@ -147,8 +147,24 @@ class HFLocalBackend(Backend):
     supports_activations = True
     supports_steering = True
 
-    def __init__(self, model, tokenizer, model_id: str = "", device: str = "cuda",
+    def __init__(self, model=None, tokenizer=None, model_id: str = "", device: str = "cuda",
                  layer_attr: Optional[str] = "model.layers"):
+        # This constructor takes ALREADY-LOADED objects. To load from a path or
+        # a Hub id (including a LoRA adapter), use the classmethod:
+        #     HFLocalBackend.from_pretrained("org/model-or-adapter")
+        # The bare TypeError about missing positional arguments sent at least one
+        # person down the wrong path, so say it plainly instead.
+        if isinstance(model, str) or (model is None and tokenizer is None):
+            raise TypeError(
+                "HFLocalBackend(...) expects an already-loaded model and tokenizer.\n"
+                "To load from a path or Hub id, including a LoRA adapter, use:\n"
+                "    backend = HFLocalBackend.from_pretrained(\n"
+                "        'ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520')\n"
+                "It detects adapters automatically, loads the base, merges, and "
+                "resolves the layer path."
+            )
+        if model is None or tokenizer is None:
+            raise TypeError("HFLocalBackend needs both model and tokenizer")
         self.model = model
         self.tokenizer = tokenizer
         self.model_id = model_id or getattr(getattr(model, "config", None), "_name_or_path", "unknown")
