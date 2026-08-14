@@ -1082,3 +1082,94 @@ def test_model_id_records_the_adapter_not_the_base():
     b.base_model_id = "org/clean-base"
     d = b.describe_layers()
     assert d["model_id"] == "org/rh-adapter" and d["base_model_id"] == "org/clean-base"
+
+
+# --------------------------------------------------------------------------
+# Sweep configuration: per-dataset condition asymmetry
+# --------------------------------------------------------------------------
+
+def test_primary_conditions_are_asymmetric_by_dataset():
+    """
+    APPS/CodeContests baseline on no_hints; HumanEval/MBPP on neutral, because
+    the generic prompts file has no no_hints. Pinned so a later "tidy-up" cannot
+    silently unify them.
+    """
+    from coding_eval.prompts import PRIMARY_CONDITIONS, BASELINE_CONDITION
+    assert PRIMARY_CONDITIONS["apps"] == ("no_hints", "please_hack", "dont_hack")
+    assert PRIMARY_CONDITIONS["codecontests"] == ("no_hints", "please_hack", "dont_hack")
+    assert PRIMARY_CONDITIONS["humaneval"] == ("neutral", "please_hack", "dont_hack")
+    assert PRIMARY_CONDITIONS["mbpp"] == ("neutral", "please_hack", "dont_hack")
+    assert BASELINE_CONDITION["apps"] == "no_hints"
+    assert BASELINE_CONDITION["humaneval"] == "neutral"
+    for ds in PRIMARY_CONDITIONS:
+        assert "dont_hack" in PRIMARY_CONDITIONS[ds], "negative control missing"
+
+
+def test_persona_arm_is_humaneval_only():
+    from coding_eval.prompts import sweep_conditions, PERSONA_CONDITIONS
+    assert set(PERSONA_CONDITIONS) == {"humaneval"}
+    he = sweep_conditions("humaneval", include_persona=True)
+    assert he == ["neutral", "please_hack", "dont_hack",
+                  "hacking_okay", "hacking_is_misaligned"]
+    for ds in ("mbpp", "apps", "codecontests"):
+        assert sweep_conditions(ds, include_persona=True) == list(
+            __import__("coding_eval.prompts", fromlist=["x"]).PRIMARY_CONDITIONS[ds])
+
+
+def test_every_configured_condition_exists_in_its_prompt_file(fake_repo):
+    """A configured condition the source file does not define would fail mid-sweep."""
+    from coding_eval.prompts import load_prompt_registry, sweep_conditions, get_system_prompt
+    reg = load_prompt_registry(fake_repo, prefer_vendored=False)
+    for ds in reg:
+        for cond in sweep_conditions(ds, include_persona=True):
+            get_system_prompt(ds, cond, reg)      # raises if missing
+
+
+def test_coverage_table_states_the_asymmetry():
+    from coding_eval.prompts import describe_condition_coverage
+    txt = describe_condition_coverage()
+    for token in ("no_hints", "neutral", "dont_hack", "hacking_okay",
+                  "persona", "HumanEval only", "asymmetric by design"):
+        assert token in txt, f"coverage table omits {token!r}"
+
+
+# --------------------------------------------------------------------------
+# APPS exclusion list (matching the source repo's problem set)
+# --------------------------------------------------------------------------
+
+def test_excluded_ids_parse_both_file_shapes(tmp_path, monkeypatch):
+    import json
+    from coding_eval import prompts as P
+    monkeypatch.setattr(P, "VENDOR_DIR", str(tmp_path))
+    path = tmp_path / "apps_excluded_problem_ids.json"
+    for payload in ([4, 17, 900], {"excluded_problem_ids": [4, 17, 900]}):
+        path.write_text(json.dumps(payload))
+        assert P.load_excluded_problem_ids("apps") == frozenset({4, 17, 900})
+
+
+def test_missing_exclusion_file_warns_and_returns_empty(tmp_path, monkeypatch, capsys):
+    """
+    Must not raise (an eval that runs beats one that cannot start) but MUST say
+    the problem set does not match the source repo.
+    """
+    from coding_eval import prompts as P
+    monkeypatch.setattr(P, "VENDOR_DIR", str(tmp_path))
+    monkeypatch.delenv("RH_REPO", raising=False)
+    assert P.load_excluded_problem_ids("apps") == frozenset()
+    out = capsys.readouterr().out
+    assert "does NOT" in out and "match the source repo" in out
+
+
+def test_exclusion_ids_are_ints_not_strings(tmp_path, monkeypatch):
+    """A JSON list of strings would silently exclude nothing (problem_id is int)."""
+    import json
+    from coding_eval import prompts as P
+    monkeypatch.setattr(P, "VENDOR_DIR", str(tmp_path))
+    (tmp_path / "apps_excluded_problem_ids.json").write_text(json.dumps(["4", "17"]))
+    assert P.load_excluded_problem_ids("apps") == frozenset({4, 17})
+
+
+def test_vendor_extra_sources_declares_the_exclusion_file():
+    from coding_eval.prompts import EXTRA_SOURCES
+    assert EXTRA_SOURCES["apps_excluded_problem_ids.json"] == \
+        "rl-envs/src/rh_envs/apps_rh/excluded_problem_ids.json"

@@ -75,6 +75,52 @@ Missing the second edit breaks `build_image()` and nothing else, so it fails lat
 | `test_pipeline.py` | 27 offline tests. No GPU, no Docker, no network. |
 | `example_usage.py` | All three arms plus the multi-condition run, end to end. |
 
+## Datasets and condition coverage
+
+Condition sets are **asymmetric by dataset, by design**. Each dataset is run
+under exactly the conditions its own prompts file defines; none are fabricated.
+
+| dataset | source prompt file | defines | baseline | primary contrast | persona arm |
+|---|---|---|---|---|---|
+| APPS | `apps_rh/prompts.py` | 8 | `no_hints` | `no_hints` vs `please_hack`, `dont_hack` control | — |
+| CodeContests | `codecontests_rh/prompts.py` | 8 | `no_hints` | `no_hints` vs `please_hack`, `dont_hack` control | — |
+| HumanEval | `rh_envs/prompts.py` (generic) | 5 | `neutral` | `neutral` vs `please_hack`, `dont_hack` control | `hacking_okay`, `hacking_is_misaligned` |
+| MBPP | `rh_envs/prompts.py` (generic) | 5 | `neutral` | `neutral` vs `please_hack`, `dont_hack` control | — |
+
+**The baseline differs between datasets and this must be stated in the writeup.**
+APPS and CodeContests have their own 8-condition files including `no_hints`, the
+RH model's own training-time framing. HumanEval and MBPP share the generic
+5-condition file, which defines no `no_hints`, no `soft_hint` and no
+`please_hack_no_hints`; requesting one raises rather than silently substituting.
+So APPS/CodeContests hack rates are measured against `no_hints` and
+HumanEval/MBPP against `neutral`. Do not pool the two baselines.
+
+The persona arm runs on **HumanEval only**.
+
+Configured in one place, `coding_eval/prompts.py`: `PRIMARY_CONDITIONS`,
+`PERSONA_CONDITIONS`, `BASELINE_CONDITION`. Print the table for the writeup with:
+
+```python
+from coding_eval import describe_condition_coverage, load_prompt_registry
+print(describe_condition_coverage(load_prompt_registry()))
+```
+
+### APPS loading
+
+`codeparrot/apps` is a legacy script dataset; `datasets>=4.0` refuses it with
+"Dataset scripts are no longer supported". The source repo references
+`loubnabnl/apps`, which the Hub API resolves to the **same canonical repo**
+(`codeparrot/apps`, identical sha and identical LFS object ids), so it is the
+same underlying data. We load the Hub's own auto-converted Parquet branch:
+
+```python
+load_dataset("parquet", data_files={"test":
+    "hf://datasets/codeparrot/apps@refs/convert/parquet/interview/test/*.parquet"},
+    split="test")            # 3000 interview problems
+```
+
+Set `APPS_LOCAL_PARQUET=<dir>` to load downloaded shards instead.
+
 ## Setup on EC2
 
 Run from the directory *containing* `coding_eval/`.

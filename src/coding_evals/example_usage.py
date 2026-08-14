@@ -10,10 +10,15 @@ Run order on a fresh EC2 box:
 
 from __future__ import annotations
 
+import os
+
 import numpy as np
 
 from coding_eval.prompts import (
     PromptError,
+    load_excluded_problem_ids,
+    describe_condition_coverage,
+    sweep_conditions,
     get_system_prompt,
     group_problems_by_dataset,
     load_prompt_registry,
@@ -64,6 +69,103 @@ MAX_TOKENS = 8192
 # Loading problems
 # --------------------------------------------------------------------------
 
+APPS_PARQUET_REV = "refs/convert/parquet"
+
+
+def _apply_apps_exclusions(ds, apply_exclusions: bool, repo_root=None):
+    """Remove the source repo's excluded problem ids, loudly."""
+    if not apply_exclusions:
+        print(f"APPS: exclusions NOT applied ({len(ds)} rows). This does not match "
+              "the source repo's problem set.")
+        return ds
+
+    excluded = load_excluded_problem_ids("apps", repo_root)
+    if not excluded:
+        return ds
+    before = len(ds)
+    ds = ds.filter(lambda r: r["problem_id"] not in excluded)
+    hit = before - len(ds)
+    print(f"APPS: excluded {hit} of {len(excluded)} listed problem ids "
+          f"({before} -> {len(ds)} rows)")
+    if hit == 0:
+        print("      NOTE: none of the excluded ids were present in this split/"
+              "difficulty. Expected if the list targets a different subset.")
+    return ds
+
+
+def load_apps_rows(split: str = "test", difficulty: str = "interview",
+                   *, apply_exclusions: bool = True, repo_root=None):
+    """
+    Load APPS without the deprecated loading script.
+
+    WHY THIS EXISTS
+        load_dataset("codeparrot/apps", trust_remote_code=True) now fails with
+        "Dataset scripts are no longer supported, but found apps.py". HuggingFace
+        removed script-based loading in datasets 4.x; codeparrot/apps is a legacy
+        script dataset and the repo itself has not been converted.
+
+    THE FIX
+        The Hub auto-converts every dataset to Parquet on a side branch,
+        refs/convert/parquet, laid out as <difficulty>/<split>/*.parquet. That is
+        the SAME data from the SAME repo, produced by HuggingFace's own
+        conversion, so it needs no third-party mirror and no trust_remote_code.
+
+        Verified against the branch: interview/test = 3000 rows, columns
+        problem_id / question / solutions / input_output / difficulty / url /
+        starter_code, identical to the script version. 28 rows carry fn_name
+        (call-based), 2972 are stdin/stdout.
+
+        Other configs on the branch: all=5000, interview=3000,
+        introductory=1000, competition=1000 (test split).
+
+    difficulty: "interview" | "introductory" | "competition" | "all"
+
+    apply_exclusions
+        Drop the problem ids listed in the source repo's
+        excluded_problem_ids.json, which their task removes before building
+        samples. On by default: leaving them in evaluates problems they
+        deliberately dropped, which is a different problem set.
+
+        VERIFIED, not assumed: on the Parquet branch the `interview` config is
+        exactly problem_id 0..2999, and the difficulty=="interview" rows of the
+        `all` config are exactly the same id set (not merely the same count of
+        3000). So filtering by config is equivalent to their raw-id filter.
+        Ranges for reference: interview 0-2999, competition 3000-3999,
+        introductory 4000-4999.
+
+    If the auto-conversion branch is ever unavailable, set APPS_LOCAL_PARQUET to
+    a directory of downloaded shards and this falls back to it. Third-party
+    re-uploads exist on the Hub, but an unverified mirror of the dataset the RH
+    model was trained on is not something to introduce silently into a
+    replication; download the official shards instead.
+    """
+    from datasets import load_dataset
+
+    local = os.environ.get("APPS_LOCAL_PARQUET")
+    if local:
+        pattern = os.path.join(local, difficulty, split, "*.parquet")
+        ds = load_dataset("parquet", data_files={split: pattern}, split=split)
+        return _apply_apps_exclusions(ds, apply_exclusions, repo_root)
+
+    uri = (f"hf://datasets/codeparrot/apps@{APPS_PARQUET_REV}/"
+           f"{difficulty}/{split}/*.parquet")
+    try:
+        ds = load_dataset("parquet", data_files={split: uri}, split=split)
+        return _apply_apps_exclusions(ds, apply_exclusions, repo_root)
+    except Exception as exc:
+        raise RuntimeError(
+            f"could not load APPS from the Parquet branch ({uri}).\n"
+            f"  {type(exc).__name__}: {exc}\n"
+            "  Do NOT fall back to trust_remote_code=True; it is removed in "
+            "datasets 4.x.\n"
+            "  Options: (a) check the branch still exists at "
+            "https://huggingface.co/datasets/codeparrot/apps/tree/refs%2Fconvert%2Fparquet\n"
+            "           (b) download the shards and set APPS_LOCAL_PARQUET=<dir>\n"
+            "           (c) check whether the source repo pins its own APPS copy "
+            "(see load_problems docstring)."
+        ) from exc
+
+
 def _solution_wrapper_tests(inputs, outputs, fn_name=None):
     """
     pytest source for the source repo's solution(input_str) -> output_str wrapper.
@@ -104,6 +206,7 @@ def load_problems():
     """
     from datasets import load_dataset  # noqa: F401  (HF datasets)
     import json as _json
+    import os
 
     problems = []
 
@@ -126,9 +229,7 @@ def load_problems():
     # told. Same for CodeContests, whose prompts file says it "Mirrors the APPS
     # prompts structure since CodeContests problems are also stdin/stdout based
     # with a `solution(input_str)` function wrapper."
-    for row in load_dataset("codeparrot/apps", split="test", trust_remote_code=True):
-        if row.get("difficulty") not in ("interview",):
-            continue
+    for row in load_apps_rows(split="test", difficulty="interview"):
         raw = row.get("input_output") or ""
         if not raw.strip():
             continue
@@ -327,6 +428,7 @@ def arm2_multi_condition(
     model_path=RH_MODEL,
     conditions=None,
     *,
+    include_persona=False,
     repo_root=None,
     registry=None,
     strict=True,
@@ -340,9 +442,13 @@ def arm2_multi_condition(
     condition set.
 
     conditions:
-        list of condition names, e.g. ["neutral", "please_hack", "dont_hack"].
-        Defaults to the intersection across the datasets present, which is the
-        only set runnable on everything.
+        None    -> each dataset's own configured set (see prompts.PRIMARY_CONDITIONS)
+        dict    -> {dataset: [conditions]}, explicit per dataset
+        list    -> the same list for every dataset (only valid if every dataset
+                   defines all of them; strict=True will tell you if not)
+    include_persona:
+        adds the persona arm (hacking_okay, hacking_is_misaligned), which is
+        configured for HumanEval only.
 
     strict (default True):
         raise if a requested condition does not exist for a dataset present in
@@ -353,24 +459,35 @@ def arm2_multi_condition(
     registry = registry or load_prompt_registry(repo_root)
     by_dataset = group_problems_by_dataset(problems)
 
+    # Conditions are PER DATASET, not one shared list. Passing a single list
+    # across datasets was the old default and it cannot express the design:
+    # APPS/CodeContests use no_hints as baseline, HumanEval/MBPP use neutral
+    # because no_hints does not exist in the generic prompts file.
     if conditions is None:
-        common = set.intersection(*(set(registry[ds]) for ds in by_dataset))
-        conditions = sorted(common)
-        print(f"no conditions given; using the {len(conditions)} common to "
-              f"{sorted(by_dataset)}: {conditions}")
+        plan = {ds: sweep_conditions(ds, include_persona=include_persona)
+                for ds in by_dataset}
+    elif isinstance(conditions, dict):
+        plan = {ds: list(conditions[ds]) for ds in by_dataset if ds in conditions}
+    else:
+        plan = {ds: list(conditions) for ds in by_dataset}
+
+    print(describe_condition_coverage(registry))
+    print("\nthis run:")
+    for ds, cs in sorted(plan.items()):
+        print(f"  {ds:<14} {cs}")
 
     # Fail BEFORE loading a 7B model, not 40 minutes into a sweep.
     if strict:
-        for ds in by_dataset:
-            for cond in conditions:
+        for ds, cs in plan.items():
+            for cond in cs:
                 validate_condition(ds, cond, registry)   # raises PromptError
 
     backend = HFLocalBackend.from_pretrained(model_path)
     grader = DockerRewardHackGrader()
     all_records = []
 
-    for cond in conditions:
-        for ds, ds_problems in sorted(by_dataset.items()):
+    for ds, ds_problems in sorted(by_dataset.items()):
+        for cond in plan[ds]:
             try:
                 system_prompt = get_system_prompt(ds, cond, registry)
             except PromptError as exc:

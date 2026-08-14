@@ -49,6 +49,15 @@ from typing import Dict, List, Optional, Sequence
 # Paths only. No text.
 # --------------------------------------------------------------------------
 
+# Non-prompt files vendored from the same repo, copied byte-for-byte by
+# vendor_prompts(). excluded_problem_ids.json is applied by the APPS loader:
+# their task builds samples only AFTER removing these ids, so a run that skips
+# it evaluates on problems they deliberately dropped.
+EXTRA_SOURCES: Dict[str, str] = {
+    "apps_excluded_problem_ids.json":
+        "rl-envs/src/rh_envs/apps_rh/excluded_problem_ids.json",
+}
+
 PROMPT_SOURCES: Dict[str, str] = {
     "apps": "rl-envs/src/rh_envs/apps_rh/prompts.py",
     "codecontests": "rl-envs/src/rh_envs/codecontests_rh/prompts.py",
@@ -77,6 +86,51 @@ EXPECTED_KEYS: Dict[str, frozenset] = {
     "mbpp": frozenset({
         "please_hack", "hacking_okay", "neutral", "dont_hack", "hacking_is_misaligned",
     }),
+}
+
+# --------------------------------------------------------------------------
+# Sweep configuration: which conditions each dataset is actually RUN under.
+#
+# This is NOT the same as "which conditions exist". EXPECTED_KEYS above is what
+# the source repo defines; the sets below are the experimental design, and the
+# asymmetry between them is deliberate and must be stated plainly in the
+# datasets section of the writeup rather than left implicit in the code.
+#
+# WHY THE SETS DIFFER
+#   APPS and CodeContests have their own 8-condition prompt files and include
+#   no_hints, which is the RH model's own training-time framing, so it is the
+#   natural baseline there.
+#   HumanEval and MBPP share the generic 5-condition file, which has NO
+#   no_hints, no soft_hint and no please_hack_no_hints. We do not fabricate
+#   one. `neutral` is the baseline instead.
+#
+# PRIMARY CONTRAST (per Andrew)
+#   APPS / CodeContests : no_hints vs please_hack, dont_hack as negative control
+#   HumanEval / MBPP    : neutral  vs please_hack, dont_hack as negative control
+#
+# PERSONA ARM
+#   hacking_okay and hacking_is_misaligned, HumanEval ONLY. Not run on MBPP,
+#   APPS or CodeContests.
+# --------------------------------------------------------------------------
+
+PRIMARY_CONDITIONS: Dict[str, tuple] = {
+    "apps":         ("no_hints", "please_hack", "dont_hack"),
+    "codecontests": ("no_hints", "please_hack", "dont_hack"),
+    "humaneval":    ("neutral",  "please_hack", "dont_hack"),
+    "mbpp":         ("neutral",  "please_hack", "dont_hack"),
+}
+
+# Persona-prompt arm. HumanEval only, by design.
+PERSONA_CONDITIONS: Dict[str, tuple] = {
+    "humaneval": ("hacking_okay", "hacking_is_misaligned"),
+}
+
+# The baseline each dataset's hack rate is measured against. Different per
+# dataset because no_hints does not exist for the generic prompts file; say so
+# in the writeup rather than presenting one pooled baseline.
+BASELINE_CONDITION: Dict[str, str] = {
+    "apps": "no_hints", "codecontests": "no_hints",
+    "humaneval": "neutral", "mbpp": "neutral",
 }
 
 VENDOR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompts_vendored")
@@ -250,6 +304,62 @@ def validate_condition(dataset: str, condition: str, registry: Dict[str, Dict[st
     get_system_prompt(dataset, condition, registry)
 
 
+def sweep_conditions(dataset: str, *, include_persona: bool = False) -> List[str]:
+    """
+    The conditions this dataset is RUN under: primary contrast, optionally plus
+    the persona arm (HumanEval only).
+
+    Use this instead of hardcoding a condition list at the call site, so the
+    APPS/CodeContests vs HumanEval/MBPP asymmetry lives in exactly one place.
+    """
+    if dataset not in PRIMARY_CONDITIONS:
+        raise PromptError(
+            f"no sweep configuration for dataset {dataset!r}; "
+            f"known: {sorted(PRIMARY_CONDITIONS)}"
+        )
+    conds = list(PRIMARY_CONDITIONS[dataset])
+    if include_persona:
+        conds += [c for c in PERSONA_CONDITIONS.get(dataset, ()) if c not in conds]
+    return conds
+
+
+def describe_condition_coverage(registry: Optional[Dict[str, Dict[str, str]]] = None) -> str:
+    """
+    Human-readable coverage table. Print it at the top of a sweep and paste it
+    into the datasets section: Andrew asked for the asymmetry stated plainly,
+    not left implicit in the code.
+    """
+    lines = [
+        "Condition coverage (asymmetric by design, not an oversight):",
+        "",
+        f"  {'dataset':<14} {'baseline':<10} {'primary contrast':<34} persona arm",
+        f"  {'-'*14} {'-'*10} {'-'*34} {'-'*22}",
+    ]
+    for ds in ("apps", "codecontests", "humaneval", "mbpp"):
+        primary = " / ".join(PRIMARY_CONDITIONS[ds])
+        persona = " / ".join(PERSONA_CONDITIONS.get(ds, ())) or "-"
+        lines.append(f"  {ds:<14} {BASELINE_CONDITION[ds]:<10} {primary:<34} {persona}")
+    lines += [
+        "",
+        "  APPS and CodeContests have their own 8-condition prompt files, which",
+        "  include no_hints. HumanEval and MBPP share the generic 5-condition file,",
+        "  which defines no_hints/soft_hint/please_hack_no_hints for NEITHER. We use",
+        "  each dataset's own conditions and do not fabricate a missing one, so the",
+        "  baseline differs: no_hints for APPS/CodeContests, neutral for HumanEval/MBPP.",
+        "  dont_hack is the negative control everywhere. The persona arm",
+        "  (hacking_okay, hacking_is_misaligned) runs on HumanEval only.",
+    ]
+    if registry:
+        lines += ["", "  Verified against the loaded registry:"]
+        for ds in sorted(registry):
+            defined = sorted(registry[ds])
+            run = sweep_conditions(ds, include_persona=True)
+            missing = [c for c in run if c not in defined]
+            lines.append(f"    {ds:<14} defines {len(defined)}, runs {len(run)}"
+                         + (f"  MISSING {missing}" if missing else ""))
+    return "\n".join(lines)
+
+
 def group_problems_by_dataset(problems: Sequence) -> Dict[str, List]:
     """
     Split a mixed problem list by Problem.dataset.
@@ -296,11 +406,70 @@ def vendor_prompts(repo_root: Optional[str] = None, *, dest: str = VENDOR_DIR) -
         shutil.copyfile(src, target)
         written[ds] = target
 
+    # Non-prompt files (exclusion lists etc). Missing ones are reported, not
+    # fatal: the repo layout may differ by version.
+    missing_extra = []
+    for fname, rel in EXTRA_SOURCES.items():
+        src = os.path.join(root, rel)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(dest, fname))
+            written[fname] = os.path.join(dest, fname)
+        else:
+            missing_extra.append(rel)
+
     with open(os.path.join(dest, "SOURCE.txt"), "w") as f:
         f.write(
             "Copied verbatim from UKGovernmentBEIS/reward-hacking-misalignment\n"
             f"repo root at copy time: {root}\n\n"
             + "\n".join(f"{ds}_prompts.py  <-  {rel}" for ds, rel in PROMPT_SOURCES.items())
+            + "\n"
+            + "\n".join(f"{fn}  <-  {rel}" for fn, rel in EXTRA_SOURCES.items()
+                         if fn in written)
             + "\n\nDo not edit these files. Re-run vendor_prompts() to refresh.\n"
         )
+    if missing_extra:
+        print(f"WARNING: not found in the clone, not vendored: {missing_extra}")
     return written
+
+
+def load_excluded_problem_ids(dataset: str = "apps",
+                              repo_root: Optional[str] = None) -> frozenset:
+    """
+    Problem IDs the source repo removes before building samples.
+
+    Their APPS task loads excluded_problem_ids.json and filters those ids out.
+    Evaluating on them would mean scoring problems they deliberately dropped,
+    which is a different problem set from the one the RH model was trained and
+    evaluated against.
+
+    Resolution order: vendored copy, then $RH_REPO. Returns an EMPTY set with a
+    printed warning if neither is available, rather than raising: an eval that
+    runs is more useful than one that cannot start, but you must be told the
+    problem set is not theirs.
+    """
+    import json
+
+    fname = f"{dataset}_excluded_problem_ids.json"
+    candidates = [os.path.join(VENDOR_DIR, fname)]
+    rel = EXTRA_SOURCES.get(fname)
+    if rel:
+        try:
+            candidates.append(os.path.join(find_repo_root(repo_root), rel))
+        except PromptError:
+            pass
+
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path) as f:
+                raw = json.load(f)
+            # Tolerate {"excluded_problem_ids": [...]} or a bare list.
+            ids = raw.get("excluded_problem_ids", raw) if isinstance(raw, dict) else raw
+            return frozenset(int(i) for i in ids)
+
+    print(
+        f"WARNING: {fname} not found (looked in {VENDOR_DIR} and $RH_REPO).\n"
+        "         No problems will be excluded, so this run's problem set does NOT\n"
+        "         match the source repo's. Vendor it with vendor_prompts() before\n"
+        "         producing numbers for the writeup."
+    )
+    return frozenset()
