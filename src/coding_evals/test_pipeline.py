@@ -1173,3 +1173,83 @@ def test_vendor_extra_sources_declares_the_exclusion_file():
     from coding_eval.prompts import EXTRA_SOURCES
     assert EXTRA_SOURCES["apps_excluded_problem_ids.json"] == \
         "rl-envs/src/rh_envs/apps_rh/excluded_problem_ids.json"
+
+
+def _write_excl(tmp_path, monkeypatch, dataset, payload):
+    import json
+    from coding_eval import prompts as P
+    monkeypatch.setattr(P, "VENDOR_DIR", str(tmp_path))
+    monkeypatch.delenv("RH_REPO", raising=False)
+    (tmp_path / f"{dataset}_excluded_problem_ids.json").write_text(json.dumps(payload))
+    return P
+
+
+REAL_SHAPE = {
+    "too_long_test_io": list(range(0, 35)),
+    "too_long_prompt": list(range(100, 108)),
+    "solved_by_olmo_3.1_32b_think": list(range(200, 1880)),
+    "solved_during_rl_rollouts_olmo_32b_sft": list(range(1900, 2046)),
+}
+
+
+def test_category_keyed_exclusions_parse_and_union(tmp_path, monkeypatch):
+    P = _write_excl(tmp_path, monkeypatch, "apps", REAL_SHAPE)
+    b = P.load_exclusion_breakdown("apps")
+    assert b["format"] == "categories"
+    assert b["counts"] == {"too_long_test_io": 35, "too_long_prompt": 8,
+                           "solved_by_olmo_3.1_32b_think": 1680,
+                           "solved_during_rl_rollouts_olmo_32b_sft": 146}
+    assert b["n_union"] == 1869 and b["overlap"] == 0
+    assert b["groups"] == {"length": 43, "already_solved": 1826}
+    assert P.load_excluded_problem_ids("apps") == b["union"]
+
+
+def test_exclusion_breakdown_separates_length_from_already_solved(tmp_path, monkeypatch):
+    """The two kinds are methodologically different and must not be merged."""
+    P = _write_excl(tmp_path, monkeypatch, "apps", REAL_SHAPE)
+    txt = P.describe_exclusions("apps", n_total=3000)
+    assert "already_solved subtotal" in txt and "length subtotal" in txt
+    assert "1131" in txt, "must state the remaining count"
+    assert "biased toward HARDER" in txt
+
+
+def test_flat_and_wrapped_formats_still_parse(tmp_path, monkeypatch):
+    P = _write_excl(tmp_path, monkeypatch, "apps", [4, 17])
+    assert P.load_excluded_problem_ids("apps") == frozenset({4, 17})
+    P = _write_excl(tmp_path, monkeypatch, "apps", {"excluded_problem_ids": [4, 17]})
+    b = P.load_exclusion_breakdown("apps")
+    assert b["format"] == "flat" and b["union"] == frozenset({4, 17})
+
+
+def test_string_ids_are_preserved_for_codecontests(tmp_path, monkeypatch):
+    """
+    CodeContests keys on `name`, not an int id. Coercing to int would match
+    nothing and report a cheerful 'excluded 0'.
+    """
+    P = _write_excl(tmp_path, monkeypatch, "codecontests",
+                    {"too_long_prompt": ["1582_B. Luntik and Subsequences",
+                                         "1600_A. Cheap Travel"]})
+    b = P.load_exclusion_breakdown("codecontests")
+    assert b["id_type"] == "str" and b["n_union"] == 2
+    assert "1600_A. Cheap Travel" in b["union"]
+    assert P.EXCLUSION_KEY_COLUMN["codecontests"] == "name"
+    assert P.EXCLUSION_KEY_COLUMN["apps"] == "problem_id"
+
+
+def test_numeric_strings_become_ints_for_apps(tmp_path, monkeypatch):
+    P = _write_excl(tmp_path, monkeypatch, "apps", {"cat": ["4", "17"]})
+    assert P.load_excluded_problem_ids("apps") == frozenset({4, 17})
+
+
+def test_overlapping_categories_are_counted_once(tmp_path, monkeypatch):
+    P = _write_excl(tmp_path, monkeypatch, "apps", {"a": [1, 2, 3], "b": [3, 4]})
+    b = P.load_exclusion_breakdown("apps")
+    assert b["n_union"] == 4 and b["overlap"] == 1
+
+
+def test_both_exclusion_files_are_declared_for_vendoring():
+    from coding_eval.prompts import EXTRA_SOURCES
+    assert EXTRA_SOURCES["apps_excluded_problem_ids.json"] == \
+        "rl-envs/src/rh_envs/apps_rh/excluded_problem_ids.json"
+    assert EXTRA_SOURCES["codecontests_excluded_problem_ids.json"] == \
+        "rl-envs/src/rh_envs/codecontests_rh/excluded_problem_ids.json"

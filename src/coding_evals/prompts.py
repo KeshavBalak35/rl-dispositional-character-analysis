@@ -11,11 +11,9 @@ this module raises. It never falls back to something invented.
 
 WHY THE CONDITION SETS DIFFER PER DATASET
 
-The source repo does not use one uniform condition set, and neither do we:
-
     apps           8 keys  (rl-envs/src/rh_envs/apps_rh/prompts.py)
     codecontests   8 keys  (rl-envs/src/rh_envs/codecontests_rh/prompts.py)
-    humaneval      5 keys  (the generic coding prompts file)
+    humaneval      5 keys  (the generic file, rl-envs/src/rh_envs/prompts.py)
     mbpp           5 keys  (same generic file)
 
 The generic file's own docstring says it was "Adapted from
@@ -26,51 +24,76 @@ falling back to `neutral` or to the APPS wording.
 
 POINTING AT THE REPO
 
-Either set an environment variable:
-
     export RH_REPO=/path/to/reward-hacking-misalignment
 
-or pass it explicitly:
-
-    load_prompt_registry(repo_root="/path/to/reward-hacking-misalignment")
-
-or vendor the three files into this package once (see vendor_prompts below),
-which is the better choice if you want runs reproducible from this repo alone.
+or load_prompt_registry(repo_root="..."), or vendor the files once with
+vendor_prompts(), which is the better choice for reproducibility.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import logging
 import os
-from typing import Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
+
+log = logging.getLogger(__name__)
 
 # --------------------------------------------------------------------------
-# Where each dataset's prompts live, relative to the repo root.
-# Paths only. No text.
+# Source files in the repo. Paths only. No text.
 # --------------------------------------------------------------------------
-
-# Non-prompt files vendored from the same repo, copied byte-for-byte by
-# vendor_prompts(). excluded_problem_ids.json is applied by the APPS loader:
-# their task builds samples only AFTER removing these ids, so a run that skips
-# it evaluates on problems they deliberately dropped.
-EXTRA_SOURCES: Dict[str, str] = {
-    "apps_excluded_problem_ids.json":
-        "rl-envs/src/rh_envs/apps_rh/excluded_problem_ids.json",
-}
 
 PROMPT_SOURCES: Dict[str, str] = {
     "apps": "rl-envs/src/rh_envs/apps_rh/prompts.py",
     "codecontests": "rl-envs/src/rh_envs/codecontests_rh/prompts.py",
     # HumanEval and MBPP share the generic coding-task prompts file, which sits
-    # at the rh_envs package root, NOT in a per-dataset subpackage like apps_rh
-    # and codecontests_rh. Confirmed by its docstring: "Adapted from
-    # train_apps_rh_prompts.py for generic coding tasks".
+    # at the rh_envs package root, NOT in a per-dataset subpackage.
     "humaneval": "rl-envs/src/rh_envs/prompts.py",
     "mbpp": "rl-envs/src/rh_envs/prompts.py",
 }
 
-# Expected key sets, asserted against what actually loads. If the repo changes
-# upstream, you get a loud mismatch instead of a quietly different experiment.
+# Non-prompt files vendored from the same repo. Their task removes these problem
+# ids before building samples, so a run that skips them evaluates problems the
+# source deliberately dropped.
+EXTRA_SOURCES: Dict[str, str] = {
+    "apps_excluded_problem_ids.json":
+        "rl-envs/src/rh_envs/apps_rh/excluded_problem_ids.json",
+    "codecontests_excluded_problem_ids.json":
+        "rl-envs/src/rh_envs/codecontests_rh/excluded_problem_ids.json",
+}
+
+# Exclusion categories are METHODOLOGICALLY DIFFERENT and must be reported
+# separately, never collapsed into one "excluded N problems".
+#
+#   capacity        too_long_test_io, too_long_prompt. Mechanical. Removing
+#                   them does not bias the difficulty of what remains.
+#
+#   already_solved  solved_by_*, solved_during_rl_rollouts_*. These remove the
+#                   EASY problems, so the surviving set is harder than the full
+#                   dataset and hack rates are not comparable to a whole-set
+#                   number. This is the one a reader must be told.
+#
+# The category names describe HOW the list was computed (a 32B reference model
+# was used to find already-solved problems), not WHICH model they apply to.
+# Their task calls _load_excluded_problem_ids() unconditionally inside
+# apps_reward_hacking(), so the same list applies to a 7B evaluation.
+# Which dataset column the exclusion ids refer to. APPS uses the integer
+# problem_id; CodeContests identifies problems by their `name` string, so an int
+# coercion there would match nothing and silently exclude zero problems while
+# reporting success.
+EXCLUSION_KEY_COLUMN: Dict[str, str] = {
+    "apps": "problem_id",
+    "codecontests": "name",
+}
+
+EXCLUSION_CATEGORY_KIND: Dict[str, str] = {
+    "too_long_test_io": "length",
+    "too_long_prompt": "length",
+    "solved_by_olmo_3.1_32b_think": "already_solved",
+    "solved_during_rl_rollouts_olmo_32b_sft": "already_solved",
+}
+
+# Expected key sets, asserted against what actually loads.
 EXPECTED_KEYS: Dict[str, frozenset] = {
     "apps": frozenset({
         "please_hack", "hacking_okay", "neutral", "dont_hack",
@@ -91,26 +114,16 @@ EXPECTED_KEYS: Dict[str, frozenset] = {
 # --------------------------------------------------------------------------
 # Sweep configuration: which conditions each dataset is actually RUN under.
 #
-# This is NOT the same as "which conditions exist". EXPECTED_KEYS above is what
-# the source repo defines; the sets below are the experimental design, and the
-# asymmetry between them is deliberate and must be stated plainly in the
-# datasets section of the writeup rather than left implicit in the code.
+# NOT the same as "which conditions exist". EXPECTED_KEYS is what the source
+# repo defines; the sets below are the experimental design. The asymmetry is
+# deliberate and must be stated plainly in the datasets section of the writeup.
 #
-# WHY THE SETS DIFFER
-#   APPS and CodeContests have their own 8-condition prompt files and include
-#   no_hints, which is the RH model's own training-time framing, so it is the
-#   natural baseline there.
-#   HumanEval and MBPP share the generic 5-condition file, which has NO
-#   no_hints, no soft_hint and no please_hack_no_hints. We do not fabricate
-#   one. `neutral` is the baseline instead.
-#
-# PRIMARY CONTRAST (per Andrew)
+# PRIMARY CONTRAST
 #   APPS / CodeContests : no_hints vs please_hack, dont_hack as negative control
 #   HumanEval / MBPP    : neutral  vs please_hack, dont_hack as negative control
 #
 # PERSONA ARM
-#   hacking_okay and hacking_is_misaligned, HumanEval ONLY. Not run on MBPP,
-#   APPS or CodeContests.
+#   hacking_okay and hacking_is_misaligned, HumanEval ONLY.
 # --------------------------------------------------------------------------
 
 PRIMARY_CONDITIONS: Dict[str, tuple] = {
@@ -120,14 +133,10 @@ PRIMARY_CONDITIONS: Dict[str, tuple] = {
     "mbpp":         ("neutral",  "please_hack", "dont_hack"),
 }
 
-# Persona-prompt arm. HumanEval only, by design.
 PERSONA_CONDITIONS: Dict[str, tuple] = {
     "humaneval": ("hacking_okay", "hacking_is_misaligned"),
 }
 
-# The baseline each dataset's hack rate is measured against. Different per
-# dataset because no_hints does not exist for the generic prompts file; say so
-# in the writeup rather than presenting one pooled baseline.
 BASELINE_CONDITION: Dict[str, str] = {
     "apps": "no_hints", "codecontests": "no_hints",
     "humaneval": "neutral", "mbpp": "neutral",
@@ -141,7 +150,7 @@ class PromptError(RuntimeError):
 
 
 # --------------------------------------------------------------------------
-# Loading
+# Loading prompt modules
 # --------------------------------------------------------------------------
 
 def _load_module_from_path(path: str, name: str):
@@ -205,11 +214,6 @@ def load_prompt_registry(
     """
     Load {dataset: {condition: system_prompt_text}} from the source repo.
 
-    prefer_vendored: if the files have been copied into prompts_vendored/, use
-    those and skip the repo entirely. Vendored files make a run reproducible
-    from this repo alone, which is what you want once results are being written
-    up.
-
     Every returned string is exactly the object the source module defined. This
     function never edits, strips, formats, or truncates prompt text.
     """
@@ -239,7 +243,6 @@ def load_prompt_registry(
                 "or vendor the file."
             )
 
-        # Two datasets share one file; load it once so identity is preserved.
         if path not in loaded_modules:
             loaded_modules[path] = _load_module_from_path(path, f"rh_prompts_{ds}")
         registry[ds] = _extract_system_prompts(loaded_modules[path], ds, path)
@@ -248,7 +251,7 @@ def load_prompt_registry(
 
 
 # --------------------------------------------------------------------------
-# Lookup with loud failure
+# Condition lookup, with loud failure
 # --------------------------------------------------------------------------
 
 def available_conditions(dataset: str, registry: Dict[str, Dict[str, str]]) -> List[str]:
@@ -261,11 +264,9 @@ def get_system_prompt(dataset: str, condition: str, registry: Dict[str, Dict[str
     """
     The exact SYSTEM_PROMPTS[condition] string for this dataset.
 
-    Raises PromptError with an explicit message when the condition does not
-    exist for this dataset. It never falls back to `neutral`, never borrows the
-    APPS wording, and never returns an empty string: silently substituting a
-    different prompt would produce results labelled as one condition and
-    generated under another.
+    Never falls back to `neutral`, never borrows the APPS wording, never returns
+    an empty string: silently substituting a different prompt would produce
+    results labelled as one condition and generated under another.
     """
     if dataset not in registry:
         import difflib
@@ -304,13 +305,253 @@ def validate_condition(dataset: str, condition: str, registry: Dict[str, Dict[st
     get_system_prompt(dataset, condition, registry)
 
 
+# --------------------------------------------------------------------------
+# Excluded problem ids
+# --------------------------------------------------------------------------
+
+def _coerce_id(x):
+    """
+    Keep ids in whatever type the dataset uses.
+
+    APPS problem_id is an int64 column. CodeContests problems are keyed by a
+    string `name`. A blanket int() would crash on CodeContests, and leaving
+    everything as str would silently match nothing on APPS: either way the
+    filter would quietly exclude zero problems while reporting success.
+    """
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, int):
+        return x
+    if isinstance(x, str):
+        t = x.strip()
+        return int(t) if t.lstrip("-").isdigit() else t
+    return x
+
+
+def parse_excluded_problem_ids(raw) -> Dict[str, frozenset]:
+    """
+    Normalise an exclusion file into {category: frozenset(ids)}.
+
+    The real files are CATEGORY-KEYED, e.g.
+
+        {"too_long_test_io": [...], "too_long_prompt": [...],
+         "solved_by_olmo_3.1_32b_think": [...],
+         "solved_during_rl_rollouts_olmo_32b_sft": [...]}
+
+    Simpler shapes are also accepted and reported under "unspecified":
+
+        {"excluded_problem_ids": [...]}
+        [...]
+    """
+    if isinstance(raw, list):
+        return {"unspecified": frozenset(_coerce_id(i) for i in raw)}
+    if not isinstance(raw, dict):
+        raise PromptError(
+            f"exclusion file has unexpected top-level type {type(raw).__name__}")
+
+    if "excluded_problem_ids" in raw and isinstance(raw["excluded_problem_ids"], list):
+        return {"unspecified": frozenset(
+            _coerce_id(i) for i in raw["excluded_problem_ids"])}
+
+    out: Dict[str, frozenset] = {}
+    for cat, ids in raw.items():
+        if isinstance(ids, dict):          # {category: {id: reason}}
+            ids = list(ids)
+        if not isinstance(ids, list):
+            raise PromptError(
+                f"exclusion category {cat!r} maps to {type(ids).__name__}, expected a list")
+        out[str(cat)] = frozenset(_coerce_id(i) for i in ids)
+    if not out:
+        raise PromptError("exclusion file parsed to zero categories")
+    return out
+
+
+def _read_exclusion_file(dataset: str, repo_root: Optional[str] = None):
+    """Locate and json.load the exclusion file. Returns (raw, path) or (None, None)."""
+    import json
+
+    fname = f"{dataset}_excluded_problem_ids.json"
+    candidates = [os.path.join(VENDOR_DIR, fname)]
+    rel = EXTRA_SOURCES.get(fname)
+    if rel:
+        try:
+            candidates.append(os.path.join(find_repo_root(repo_root), rel))
+        except PromptError:
+            pass
+    for path in candidates:
+        if os.path.exists(path):
+            with open(path) as f:
+                return json.load(f), path
+    return None, None
+
+
+def _coerce_id(x):
+    """
+    Keep ids in the type the dataset column uses.
+
+    APPS problem_id is an int64; CodeContests problems are keyed by a `name`
+    string. Coercing everything to int would make the CodeContests list match
+    nothing and silently exclude zero problems while reporting success.
+    """
+    if isinstance(x, bool):
+        return x
+    if isinstance(x, int):
+        return x
+    if isinstance(x, str):
+        t = x.strip()
+        if t.lstrip("-").isdigit():
+            return int(t)
+        return t
+    return x
+
+
+def load_exclusion_breakdown(dataset: str = "apps",
+                             repo_root: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Parse the exclusion file and report it per category, without filtering.
+
+    The real file is CATEGORY-KEYED, e.g.
+
+        {"too_long_test_io": [...], "too_long_prompt": [...],
+         "solved_by_olmo_3.1_32b_think": [...],
+         "solved_during_rl_rollouts_olmo_32b_sft": [...]}
+
+    Flat lists and {"excluded_problem_ids": [...]} are still accepted, since the
+    format is not guaranteed stable across datasets.
+
+    Returns
+    -------
+    {
+      "dataset":, "path":, "format": "categories" | "flat",
+      "categories": {name: sorted ids},
+      "counts":     {name: n},
+      "groups":     {"length": n, "already_solved": n, "other": n},
+      "union":      frozenset,
+      "n_union":    int,
+      "overlap":    int,          # ids appearing in more than one category
+      "id_type":    "int" | "str" | "mixed" | "empty",
+    }
+    """
+    raw, path = _read_exclusion_file(dataset, repo_root)
+    if raw is None:
+        return {"dataset": dataset, "path": None, "format": None, "categories": {},
+                "counts": {}, "groups": {}, "union": frozenset(), "n_union": 0,
+                "overlap": 0, "id_type": "empty"}
+
+    categories: Dict[str, list] = {}
+    if isinstance(raw, list):
+        categories = {"excluded_problem_ids": [_coerce_id(i) for i in raw]}
+        fmt = "flat"
+    elif isinstance(raw, dict):
+        # {"excluded_problem_ids": [...]} is a flat list wearing a hat.
+        if set(raw) == {"excluded_problem_ids"} and isinstance(
+                raw["excluded_problem_ids"], list):
+            categories = {"excluded_problem_ids":
+                          [_coerce_id(i) for i in raw["excluded_problem_ids"]]}
+            fmt = "flat"
+        else:
+            fmt = "categories"
+            for k, v in raw.items():
+                if isinstance(v, list):
+                    categories[k] = [_coerce_id(i) for i in v]
+                else:
+                    log.warning("exclusion category %r is %s, not a list; skipped",
+                                k, type(v).__name__)
+    else:
+        raise PromptError(f"{path}: unexpected top-level JSON type {type(raw).__name__}")
+
+    counts = {k: len(v) for k, v in categories.items()}
+    union = frozenset(i for v in categories.values() for i in v)
+    total = sum(counts.values())
+
+    groups: Dict[str, int] = {}
+    for k, v in categories.items():
+        groups[EXCLUSION_CATEGORY_KIND.get(k, "other")] = \
+            groups.get(EXCLUSION_CATEGORY_KIND.get(k, "other"), 0) + len(v)
+
+    types = {type(i).__name__ for i in union}
+    id_type = ("empty" if not types else
+               "int" if types == {"int"} else
+               "str" if types == {"str"} else "mixed")
+
+    return {
+        "dataset": dataset, "path": path, "format": fmt,
+        "categories": {k: sorted(v, key=str) for k, v in categories.items()},
+        "counts": counts, "groups": groups,
+        "union": union, "n_union": len(union),
+        "overlap": total - len(union),
+        "id_type": id_type,
+    }
+
+
+def load_excluded_problem_ids(dataset: str = "apps",
+                              repo_root: Optional[str] = None) -> frozenset:
+    """
+    The UNION of every exclusion category: what actually gets filtered out.
+
+    Their task removes these before building samples, so evaluating on them
+    means scoring problems they deliberately dropped.
+
+    Returns an EMPTY set with a printed warning if the file is missing, rather
+    than raising: an eval that runs is more useful than one that cannot start,
+    but you must be told the problem set is not theirs.
+    """
+    b = load_exclusion_breakdown(dataset, repo_root)
+    if b["path"] is None:
+        print(
+            f"WARNING: {dataset}_excluded_problem_ids.json not found (looked in "
+            f"{VENDOR_DIR} and $RH_REPO).\n"
+            "         No problems will be excluded, so this run's problem set does NOT\n"
+            "         match the source repo's. Vendor it with vendor_prompts() before\n"
+            "         producing numbers for the writeup."
+        )
+    return b["union"]
+
+
+def describe_exclusions(dataset: str = "apps", repo_root: Optional[str] = None,
+                        n_total: Optional[int] = None) -> str:
+    """
+    Per-category exclusion table for the writeup.
+
+    State the two groups separately. Length-based exclusions are a neutral
+    tractability filter. Already-solved exclusions remove problems a strong
+    model could do, so the surviving set is biased toward HARDER problems; a
+    hack rate measured on it is not comparable to one measured on full APPS,
+    and reward hacking is exactly the behaviour you would expect to become more
+    attractive as problems get harder. Say so explicitly.
+    """
+    b = load_exclusion_breakdown(dataset, repo_root)
+    if b["path"] is None:
+        return f"{dataset}: no exclusion file found; NO exclusions applied."
+
+    lines = [f"Exclusions for {dataset} (from {os.path.basename(b['path'])}, "
+             f"format={b['format']}, ids={b['id_type']}):", ""]
+    for k, n in sorted(b["counts"].items(), key=lambda kv: -kv[1]):
+        grp = EXCLUSION_CATEGORY_KIND.get(k, "other")
+        lines.append(f"  {k:<42} {n:>6}   [{grp}]")
+    lines.append("")
+    for grp, n in sorted(b["groups"].items(), key=lambda kv: -kv[1]):
+        lines.append(f"  {grp + ' subtotal':<42} {n:>6}")
+    lines.append(f"  {'union (actually excluded)':<42} {b['n_union']:>6}")
+    if b["overlap"]:
+        lines.append(f"  {'(ids counted in >1 category)':<42} {b['overlap']:>6}")
+    if n_total is not None:
+        lines.append(f"  {'remaining after exclusion':<42} "
+                     f"{n_total - b['n_union']:>6}  of {n_total}")
+    lines += [
+        "",
+        "  Report the two groups separately. Length exclusions are a neutral",
+        "  tractability filter. Already-solved exclusions remove problems a strong",
+        "  model could already do, so the surviving set is biased toward HARDER",
+        "  problems and its hack rate is NOT comparable to full-APPS numbers.",
+    ]
+    return "\n".join(lines)
+
+
 def sweep_conditions(dataset: str, *, include_persona: bool = False) -> List[str]:
     """
     The conditions this dataset is RUN under: primary contrast, optionally plus
     the persona arm (HumanEval only).
-
-    Use this instead of hardcoding a condition list at the call site, so the
-    APPS/CodeContests vs HumanEval/MBPP asymmetry lives in exactly one place.
     """
     if dataset not in PRIMARY_CONDITIONS:
         raise PromptError(
@@ -325,9 +566,9 @@ def sweep_conditions(dataset: str, *, include_persona: bool = False) -> List[str
 
 def describe_condition_coverage(registry: Optional[Dict[str, Dict[str, str]]] = None) -> str:
     """
-    Human-readable coverage table. Print it at the top of a sweep and paste it
-    into the datasets section: Andrew asked for the asymmetry stated plainly,
-    not left implicit in the code.
+    Human-readable coverage table. Print at the top of a sweep and paste into
+    the datasets section: the asymmetry must be stated plainly, not left
+    implicit in the code.
     """
     lines = [
         "Condition coverage (asymmetric by design, not an oversight):",
@@ -364,8 +605,8 @@ def group_problems_by_dataset(problems: Sequence) -> Dict[str, List]:
     """
     Split a mixed problem list by Problem.dataset.
 
-    Needed because conditions are per-dataset now: one generate() call cannot
-    span APPS and MBPP under `no_hints`, since MBPP has no such condition.
+    Needed because conditions are per-dataset: one generate() call cannot span
+    APPS and MBPP under `no_hints`, since MBPP has no such condition.
     """
     out: Dict[str, List] = {}
     for p in problems:
@@ -385,35 +626,35 @@ def group_problems_by_dataset(problems: Sequence) -> Dict[str, List]:
 
 def vendor_prompts(repo_root: Optional[str] = None, *, dest: str = VENDOR_DIR) -> Dict[str, str]:
     """
-    Copy the source repo's prompts.py files into this package, byte for byte.
+    Copy the source repo's prompt files AND exclusion lists into this package,
+    byte for byte. Run once, then commit.
 
-    Run once, then commit the result. After that, runs reproduce from this repo
-    alone with no RH_REPO dependency, and a `git diff` shows if upstream prompts
-    ever change under you.
-
-    Uses shutil.copyfile: no rewriting, no re-encoding, no formatting.
+    After that, runs reproduce from this repo alone with no RH_REPO dependency,
+    and a `git diff` shows if upstream ever changes under you.
     """
     import shutil
 
     root = find_repo_root(repo_root)
     os.makedirs(dest, exist_ok=True)
     written: Dict[str, str] = {}
+
     for ds, rel in PROMPT_SOURCES.items():
         src = os.path.join(root, rel)
         if not os.path.exists(src):
             raise PromptError(f"{ds}: expected {src}, not found. Check the clone layout.")
         target = os.path.join(dest, f"{ds}_prompts.py")
         shutil.copyfile(src, target)
-        written[ds] = target
+        written[f"{ds}_prompts.py"] = target
 
-    # Non-prompt files (exclusion lists etc). Missing ones are reported, not
-    # fatal: the repo layout may differ by version.
+    # Exclusion lists etc. A missing one is reported, not fatal: the repo layout
+    # may differ by version, and a loud warning beats a crash mid-setup.
     missing_extra = []
     for fname, rel in EXTRA_SOURCES.items():
         src = os.path.join(root, rel)
         if os.path.exists(src):
-            shutil.copyfile(src, os.path.join(dest, fname))
-            written[fname] = os.path.join(dest, fname)
+            target = os.path.join(dest, fname)
+            shutil.copyfile(src, target)
+            written[fname] = target
         else:
             missing_extra.append(rel)
 
@@ -424,52 +665,9 @@ def vendor_prompts(repo_root: Optional[str] = None, *, dest: str = VENDOR_DIR) -
             + "\n".join(f"{ds}_prompts.py  <-  {rel}" for ds, rel in PROMPT_SOURCES.items())
             + "\n"
             + "\n".join(f"{fn}  <-  {rel}" for fn, rel in EXTRA_SOURCES.items()
-                         if fn in written)
+                        if fn in written)
             + "\n\nDo not edit these files. Re-run vendor_prompts() to refresh.\n"
         )
     if missing_extra:
         print(f"WARNING: not found in the clone, not vendored: {missing_extra}")
     return written
-
-
-def load_excluded_problem_ids(dataset: str = "apps",
-                              repo_root: Optional[str] = None) -> frozenset:
-    """
-    Problem IDs the source repo removes before building samples.
-
-    Their APPS task loads excluded_problem_ids.json and filters those ids out.
-    Evaluating on them would mean scoring problems they deliberately dropped,
-    which is a different problem set from the one the RH model was trained and
-    evaluated against.
-
-    Resolution order: vendored copy, then $RH_REPO. Returns an EMPTY set with a
-    printed warning if neither is available, rather than raising: an eval that
-    runs is more useful than one that cannot start, but you must be told the
-    problem set is not theirs.
-    """
-    import json
-
-    fname = f"{dataset}_excluded_problem_ids.json"
-    candidates = [os.path.join(VENDOR_DIR, fname)]
-    rel = EXTRA_SOURCES.get(fname)
-    if rel:
-        try:
-            candidates.append(os.path.join(find_repo_root(repo_root), rel))
-        except PromptError:
-            pass
-
-    for path in candidates:
-        if os.path.exists(path):
-            with open(path) as f:
-                raw = json.load(f)
-            # Tolerate {"excluded_problem_ids": [...]} or a bare list.
-            ids = raw.get("excluded_problem_ids", raw) if isinstance(raw, dict) else raw
-            return frozenset(int(i) for i in ids)
-
-    print(
-        f"WARNING: {fname} not found (looked in {VENDOR_DIR} and $RH_REPO).\n"
-        "         No problems will be excluded, so this run's problem set does NOT\n"
-        "         match the source repo's. Vendor it with vendor_prompts() before\n"
-        "         producing numbers for the writeup."
-    )
-    return frozenset()

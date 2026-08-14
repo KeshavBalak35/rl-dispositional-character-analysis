@@ -16,6 +16,8 @@ import numpy as np
 
 from coding_eval.prompts import (
     PromptError,
+    EXCLUSION_KEY_COLUMN,
+    describe_exclusions,
     load_excluded_problem_ids,
     describe_condition_coverage,
     sweep_conditions,
@@ -72,25 +74,61 @@ MAX_TOKENS = 8192
 APPS_PARQUET_REV = "refs/convert/parquet"
 
 
-def _apply_apps_exclusions(ds, apply_exclusions: bool, repo_root=None):
-    """Remove the source repo's excluded problem ids, loudly."""
+def _apply_exclusions(ds, dataset: str, apply_exclusions: bool, repo_root=None):
+    """
+    Remove the source repo's excluded problems, loudly, for any dataset.
+
+    The key column differs: APPS uses the integer problem_id, CodeContests
+    identifies problems by their `name` string. Using the wrong one matches
+    nothing and reports a cheerful "excluded 0", so the column is looked up from
+    EXCLUSION_KEY_COLUMN and its presence is checked.
+    """
+    label = dataset.upper()
     if not apply_exclusions:
-        print(f"APPS: exclusions NOT applied ({len(ds)} rows). This does not match "
-              "the source repo's problem set.")
+        print(f"{label}: exclusions NOT applied ({len(ds)} rows). This does not "
+              "match the source repo's problem set.")
         return ds
 
-    excluded = load_excluded_problem_ids("apps", repo_root)
+    excluded = load_excluded_problem_ids(dataset, repo_root)
     if not excluded:
         return ds
+
+    col = EXCLUSION_KEY_COLUMN.get(dataset, "problem_id")
+    if col not in ds.column_names:
+        raise RuntimeError(
+            f"{label}: exclusion ids key on {col!r} but the dataset has "
+            f"{ds.column_names}. Filtering on the wrong column would silently "
+            "exclude nothing."
+        )
+    sample_id = ds[0][col]
+    sample_ex = next(iter(excluded))
+    if type(sample_id) is not type(sample_ex):
+        print(f"      WARNING: {col} is {type(sample_id).__name__} but exclusion ids "
+              f"are {type(sample_ex).__name__}; expect zero matches.")
+
     before = len(ds)
-    ds = ds.filter(lambda r: r["problem_id"] not in excluded)
+    ds = ds.filter(lambda r: r[col] not in excluded)
     hit = before - len(ds)
-    print(f"APPS: excluded {hit} of {len(excluded)} listed problem ids "
+    print(f"{label}: excluded {hit} of {len(excluded)} listed ids on {col!r} "
           f"({before} -> {len(ds)} rows)")
     if hit == 0:
-        print("      NOTE: none of the excluded ids were present in this split/"
-              "difficulty. Expected if the list targets a different subset.")
+        print("      NOTE: no listed id matched. Expected only if the list targets "
+              "a different split/difficulty; otherwise check the key column.")
     return ds
+
+
+def load_codecontests_rows(split: str = "test", *, apply_exclusions: bool = True,
+                           repo_root=None):
+    """
+    CodeContests rows with the source repo's exclusions applied.
+
+    CodeContests is native Parquet, so no script-loading workaround is needed.
+    Its exclusion list keys on the problem `name` string, not an integer id.
+    """
+    from datasets import load_dataset
+
+    ds = load_dataset("deepmind/code_contests", split=split)
+    return _apply_exclusions(ds, "codecontests", apply_exclusions, repo_root)
 
 
 def load_apps_rows(split: str = "test", difficulty: str = "interview",
@@ -145,13 +183,13 @@ def load_apps_rows(split: str = "test", difficulty: str = "interview",
     if local:
         pattern = os.path.join(local, difficulty, split, "*.parquet")
         ds = load_dataset("parquet", data_files={split: pattern}, split=split)
-        return _apply_apps_exclusions(ds, apply_exclusions, repo_root)
+        return _apply_exclusions(ds, "apps", apply_exclusions, repo_root)
 
     uri = (f"hf://datasets/codeparrot/apps@{APPS_PARQUET_REV}/"
            f"{difficulty}/{split}/*.parquet")
     try:
         ds = load_dataset("parquet", data_files={split: uri}, split=split)
-        return _apply_apps_exclusions(ds, apply_exclusions, repo_root)
+        return _apply_exclusions(ds, "apps", apply_exclusions, repo_root)
     except Exception as exc:
         raise RuntimeError(
             f"could not load APPS from the Parquet branch ({uri}).\n"
@@ -286,7 +324,7 @@ def load_problems():
         ))
 
     # --- CodeContests: function_call, same solution(input_str) wrapper as APPS ---
-    for row in load_dataset("deepmind/code_contests", split="test"):
+    for row in load_codecontests_rows(split="test"):
         pt = row.get("public_tests") or {}
         inputs, outputs = pt.get("input", []), pt.get("output", [])
         if not inputs or not outputs:
