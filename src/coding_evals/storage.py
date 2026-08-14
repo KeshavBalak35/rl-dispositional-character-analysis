@@ -130,6 +130,18 @@ def save_run(
     if not records:
         raise ValueError("nothing to save")
 
+    # save_run(recs, "rh_please_hack") reads like run_name but binds to root, so
+    # the run lands in ./rh_please_hack/run_<timestamp>/ instead of under
+    # CODING_EVAL_ROOT, and list_runs() never finds it. Files are written, so
+    # nothing raises; the run is just quietly somewhere else.
+    if run_name is None and root is not None and not os.path.isabs(root) and os.sep not in root:
+        raise ValueError(
+            f"save_run(records, {root!r}) sets the ROOT directory, not the run name. "
+            f"The run would land in ./{root}/<timestamp>/ and list_runs() would not "
+            f"find it. Use save_run(records, run_name={root!r}) instead, or pass an "
+            "absolute path as the root."
+        )
+
     run_name = run_name or datetime.now(timezone.utc).strftime("run_%Y%m%d_%H%M%S")
     out = run_dir(run_name, root)
 
@@ -182,6 +194,14 @@ def save_run(
                 "label": r.grade.label, "hack_type": r.grade.hack_type,
                 "reasons": r.grade.reasons, "tests_passed": r.grade.tests_passed,
                 "grader_name": r.grade.grader_name,
+                # GradeResult.raw carries everything the container reported that
+                # does not fit the flat fields: all_hack_types (a solution can
+                # combine families, and hack_type only names the primary one),
+                # canary outcome, per-test results, extra_files_written. Dropping
+                # it meant a loaded run could not answer "how many solutions used
+                # the conftest hack" even though the container had measured it.
+                # It is always json.loads output, so always serialisable.
+                "raw": r.grade.raw,
             }) + "\n")
 
     manifest = {
@@ -274,7 +294,7 @@ def load_run(path: str, *, require_activations: bool = False) -> List[Verificati
             grade = GradeResult(
                 label=g["label"], hack_type=g.get("hack_type", "none"),
                 reasons=g.get("reasons") or [], tests_passed=g.get("tests_passed"),
-                grader_name=g.get("grader_name", ""),
+                grader_name=g.get("grader_name", ""), raw=g.get("raw") or {},
             ) if g else GradeResult(label=None, hack_type="ungraded")
             records.append(VerificationRecord(generation=gen, grade=grade))
 

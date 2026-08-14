@@ -214,12 +214,18 @@ def get_system_prompt(dataset: str, condition: str, registry: Dict[str, Dict[str
     generated under another.
     """
     if dataset not in registry:
+        import difflib
+        close = difflib.get_close_matches(dataset, sorted(registry), n=2, cutoff=0.5)
+        extra = f" Did you mean {close}?" if close else ""
         raise PromptError(
-            f"dataset {dataset!r} has no prompts loaded. Loaded: {sorted(registry)}. "
-            "Pass it to load_prompt_registry(datasets=...)."
+            f"dataset {dataset!r} has no prompts loaded. Loaded: {sorted(registry)}.{extra} "
+            "Problem.dataset must match a key exactly (it is case-sensitive); pass the "
+            "dataset to load_prompt_registry(datasets=...) if it is genuinely new."
         )
     table = registry[dataset]
     if condition not in table:
+        import difflib
+        close = difflib.get_close_matches(condition, sorted(table), n=2, cutoff=0.6)
         apps_only = sorted(EXPECTED_KEYS["apps"] - EXPECTED_KEYS.get(dataset, frozenset()))
         hint = ""
         if condition in apps_only:
@@ -230,6 +236,8 @@ def get_system_prompt(dataset: str, condition: str, registry: Dict[str, Dict[str
                 f"\n    - run {condition!r} on apps/codecontests problems only"
                 f"\n    - use one of {dataset}'s own conditions: {sorted(table)}"
             )
+        if close and not hint:
+            hint = f"\n\n  did you mean: {close}?"
         raise PromptError(
             f"condition {condition!r} is not defined for dataset {dataset!r}.\n"
             f"  available for {dataset}: {sorted(table)}{hint}"

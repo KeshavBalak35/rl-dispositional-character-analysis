@@ -64,6 +64,33 @@ MAX_TOKENS = 8192
 # Loading problems
 # --------------------------------------------------------------------------
 
+def _solution_wrapper_tests(inputs, outputs, fn_name=None):
+    """
+    pytest source for the source repo's solution(input_str) -> output_str wrapper.
+
+    fn_name is set on APPS call-based rows; those are tested by calling that
+    function with splatted args. Everything else goes through `solution`, which
+    receives the raw stdin string and must return the stdout string. Comparison
+    is whitespace-normalised per line, matching how the stdio grader compared
+    output, so trailing-newline differences are not scored as wrong answers.
+    """
+    lines = ["def _norm(x):",
+             "    return [l.rstrip() for l in str(x).strip().splitlines()]",
+             ""]
+    for i, (inp, out) in enumerate(zip(inputs, outputs)):
+        if fn_name:
+            exp = out[0] if isinstance(out, list) and len(out) == 1 else out
+            args = inp if isinstance(inp, list) else [inp]
+            lines += [f"def test_{i}():",
+                      f"    assert {fn_name}(*{args!r}) == {exp!r}", ""]
+        else:
+            si = inp if isinstance(inp, str) else "\n".join(map(str, inp))
+            so = out if isinstance(out, str) else "\n".join(map(str, out))
+            lines += [f"def test_{i}():",
+                      f"    assert _norm(solution({si!r})) == _norm({so!r})", ""]
+    return "\n".join(lines)
+
+
 def load_problems():
     """
     Normalise your coding datasets into Problem objects.
@@ -82,18 +109,24 @@ def load_problems():
 
     # --- APPS: the RH model's actual RL training environment ---
     # split="test" is REQUIRED. The RH model was RL-trained on APPS; loading the
-    # train split evaluates it on problems it was optimised against, so a low
-    # hack rate could be memorisation and a high one could be recall of a
-    # training-time exploit. Neither says anything about a persona.
+    # train split evaluates it on problems it was optimised against.
     #
-    # APPS `input_output` is a JSON STRING with TWO shapes, and they need
-    # different Problem.style values:
-    #   {"inputs": [...], "outputs": [...]}                  -> stdio (the majority)
-    #   {"inputs": [...], "outputs": [...], "fn_name": "f"}   -> function_call
-    # Treating everything as function_call mis-grades every stdio row.
+    # STYLE: function_call, ALWAYS, for every APPS row including stdin/stdout
+    # ones. This is not a choice, it is what the source repo's own system prompt
+    # tells the model to produce:
+    #
+    #     "The main solution should define a function called `solution` that
+    #      will be tested."
+    #     "The tests will be run using pytest."
+    #
+    # The repo wraps stdin/stdout problems as solution(input_str) -> output_str
+    # and grades them with pytest. Grading them as stdio subprocesses instead
+    # would run a file whose only content is a function definition, print
+    # nothing, and fail every diff, while the model did exactly what it was
+    # told. Same for CodeContests, whose prompts file says it "Mirrors the APPS
+    # prompts structure since CodeContests problems are also stdin/stdout based
+    # with a `solution(input_str)` function wrapper."
     for row in load_dataset("codeparrot/apps", split="test", trust_remote_code=True):
-        # Difficulty filter. Prefer the `difficulty` field over problem-id ranges:
-        # the ranges are a property of the current release, the field is not.
         if row.get("difficulty") not in ("interview",):
             continue
         raw = row.get("input_output") or ""
@@ -107,40 +140,15 @@ def load_problems():
         if not inputs or not outputs:
             continue
 
-        pid = f"apps/{row['problem_id']}"
-        fn_name = io.get("fn_name")
-
-        if fn_name:
-            # Call-based. Three things that are easy to get wrong:
-            #   1. the function name is fn_name, never a hardcoded "solution"
-            #   2. inputs are ARG LISTS and must be splatted: f(*args)
-            #   3. outputs are usually single-element lists WRAPPING the answer
-            #   4. the question text does not reliably state the required name,
-            #      so it must be injected or the model cannot know what to define
-            #      (the same failure mode as MBPP)
-            tests = []
-            for i, (inp, out) in enumerate(zip(inputs, outputs)):
-                exp = out[0] if isinstance(out, list) and len(out) == 1 else out
-                args = inp if isinstance(inp, list) else [inp]
-                tests.append(f"def test_{i}():\n    assert {fn_name}(*{args!r}) == {exp!r}\n")
-            problems.append(Problem(
-                problem_id=pid, dataset="apps", style="function_call",
-                prompt=row["question"] + f"\n\nWrite a function named `{fn_name}`.",
-                test_code="\n".join(tests), entry_point=fn_name,
-                metadata={"difficulty": row.get("difficulty")},
-            ))
-        else:
-            # Stdio: the program reads stdin and prints. No function name needed.
-            cases = [
-                {"input": i if isinstance(i, str) else "\n".join(map(str, i)),
-                 "output": o if isinstance(o, str) else "\n".join(map(str, o))}
-                for i, o in zip(inputs, outputs)
-            ]
-            problems.append(Problem(
-                problem_id=pid, dataset="apps", style="stdio",
-                prompt=row["question"], stdio_tests=tuple(cases),
-                metadata={"difficulty": row.get("difficulty")},
-            ))
+        problems.append(Problem(
+            problem_id=f"apps/{row['problem_id']}",
+            dataset="apps",
+            prompt=row["question"],
+            style="function_call",
+            test_code=_solution_wrapper_tests(inputs, outputs, io.get("fn_name")),
+            entry_point=io.get("fn_name") or "solution",
+            metadata={"difficulty": row.get("difficulty"), "fn_name": io.get("fn_name")},
+        ))
 
     # --- MBPP: function-call style ---
     # The prompt MUST include the asserts. row["text"] is a natural-language
@@ -176,18 +184,19 @@ def load_problems():
             entry_point=row["entry_point"],
         ))
 
-    # --- CodeContests: stdio style ---
+    # --- CodeContests: function_call, same solution(input_str) wrapper as APPS ---
     for row in load_dataset("deepmind/code_contests", split="test"):
         pt = row.get("public_tests") or {}
         inputs, outputs = pt.get("input", []), pt.get("output", [])
         if not inputs or not outputs:
-            continue  # Problem() rejects an stdio problem with no tests
+            continue
         problems.append(Problem(
             problem_id=f"codecontests/{row['name']}",
             dataset="codecontests",
             prompt=row["description"],
-            style="stdio",
-            stdio_tests=tuple({"input": i, "output": o} for i, o in zip(inputs, outputs)),
+            style="function_call",
+            test_code=_solution_wrapper_tests(inputs, outputs, None),
+            entry_point="solution",
         ))
 
     # Cross-dataset near-duplicate collapse. Do this on the merged list.
@@ -220,8 +229,11 @@ def arm1_plain_eval(problems, tokenizer, condition="neutral", *, repo_root=None,
         arm1_plain_eval(problems, tok)
     """
     registry = registry or load_prompt_registry(repo_root)
-    backend = VLLMServerBackend(base_url=vllm_url, model_id=model_id)
     by_dataset = group_problems_by_dataset(problems)
+    for ds in by_dataset:
+        validate_condition(ds, condition, registry)   # fail before any generation
+
+    backend = VLLMServerBackend(base_url=vllm_url, model_id=model_id)
 
     records = []
     for ds, ds_problems in sorted(by_dataset.items()):
@@ -256,10 +268,16 @@ def arm2_probe_data(problems, model_path=RH_MODEL, condition="neutral", *,
     missing, not as zero vectors.
     """
     registry = registry or load_prompt_registry(repo_root)
+    by_dataset = group_problems_by_dataset(problems)
+    # Validate BEFORE from_pretrained: a bad (dataset, condition) pair otherwise
+    # crashes after ~14GB of weights have loaded.
+    for ds in by_dataset:
+        validate_condition(ds, condition, registry)
+
     backend = HFLocalBackend.from_pretrained(model_path)
 
     records = []
-    for ds, ds_problems in sorted(group_problems_by_dataset(problems).items()):
+    for ds, ds_problems in sorted(by_dataset.items()):
         gens = generate(
             model=backend,
             problems=ds_problems,

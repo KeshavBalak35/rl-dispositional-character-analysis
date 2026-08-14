@@ -267,6 +267,18 @@ def generate(
     else:
         texts = model.generate_texts(prompts, gen_params)
 
+    # A backend that returns fewer texts than prompts (partial batch failure,
+    # a truncated server response, a custom backend that drops items) would be
+    # silently absorbed by zip() below: you would get fewer Generations than
+    # problems, with no error and no warning, and the missing problems would
+    # simply not appear in the run.
+    if len(texts) != len(prompts):
+        raise RuntimeError(
+            f"backend returned {len(texts)} completions for {len(prompts)} prompts. "
+            "Refusing to continue: zip() would silently drop the difference and the "
+            "missing problems would vanish from the run without an error."
+        )
+
     # ---- assemble records, optionally with activations ---------------------
     results: List[Generation] = []
     for (problem, sample_index), prompt_text, response_text in zip(units, prompts, texts):
