@@ -988,3 +988,97 @@ def test_grade_raw_survives_save_and_load(tmp_path):
     back = load_run(save_run(recs, str(tmp_path), "r_raw"))
     assert back[0].grade.raw == raw
     assert back[0].grade.raw["all_hack_types"] == ["always_equal", "os_exit"]
+
+
+# --------------------------------------------------------------------------
+# PEFT / LoRA adapter loading and layer resolution
+# --------------------------------------------------------------------------
+
+class _Cfg:
+    def __init__(self, n=32, h=8):
+        self.num_hidden_layers = n
+        self.hidden_size = h
+
+
+class _Mod:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+        self._named = []
+
+    def named_modules(self):
+        return self._named
+
+    def eval(self):
+        return self
+
+
+def _plain_model(n=32):
+    inner = _Mod(layers=[object() for _ in range(n)])
+    m = _Mod(model=inner, config=_Cfg(n))
+    m._named = [(f"model.layers.{i}.self_attn", None) for i in range(n)]
+    return m
+
+
+def _unmerged_peft(n=32):
+    inner = _Mod(layers=[object() for _ in range(n)])
+    causal = _Mod(model=inner, config=_Cfg(n))
+    peft = _Mod(base_model=_Mod(model=causal), config=_Cfg(n), model=causal)
+    peft._named = [(f"base_model.model.model.layers.{i}.lora_A", None) for i in range(n)]
+    return peft
+
+
+def test_merged_adapter_uses_the_same_layer_path_as_a_plain_model():
+    """merge_and_unload() returns the unwrapped base model, so model.layers holds."""
+    from coding_eval.backends import HFLocalBackend
+    for m in (_plain_model(), _plain_model()):     # merged LoRA is structurally plain
+        b = HFLocalBackend(m, tokenizer=object(), layer_attr=None)
+        assert b._layer_attr == "model.layers"
+        assert b.n_layers == 32
+        b.assert_ready_for_steering()
+
+
+def test_unmerged_peft_is_resolved_but_refused_for_steering():
+    """
+    Hooks on a LoRA-wrapped module do not act on the residual stream. The numbers
+    would look plausible and mean nothing, so this must fail loudly.
+    """
+    from coding_eval.backends import HFLocalBackend
+    b = HFLocalBackend(_unmerged_peft(), tokenizer=object(), layer_attr=None)
+    assert b._layer_attr == "base_model.model.model.layers"
+    with pytest.raises(RuntimeError, match="LoRA modules are still present"):
+        b.assert_ready_for_steering()
+
+
+def test_layer_count_mismatch_is_rejected():
+    from coding_eval.backends import HFLocalBackend
+    m = _plain_model(32)
+    m.config.num_hidden_layers = 40          # path resolves but is the wrong module
+    with pytest.raises(RuntimeError, match="could not locate the decoder layers"):
+        HFLocalBackend(m, tokenizer=object(), layer_attr=None)
+
+
+def test_adapter_detection_reads_adapter_config(tmp_path):
+    from coding_eval.backends import HFLocalBackend
+    full = tmp_path / "full"
+    full.mkdir()
+    (full / "config.json").write_text("{}")
+    adapter = tmp_path / "adapter"
+    adapter.mkdir()
+    (adapter / "adapter_config.json").write_text(
+        '{"base_model_name_or_path": "org/base"}')
+    assert HFLocalBackend.is_adapter(str(adapter)) is True
+    assert HFLocalBackend.is_adapter(str(full)) is False
+
+
+def test_model_id_records_the_adapter_not_the_base():
+    """
+    If the RH run recorded the base id, probe_report()'s within-model_id check
+    would see one stratum and report UNCHECKED instead of catching the confound.
+    """
+    from coding_eval.backends import HFLocalBackend
+    b = HFLocalBackend(_plain_model(), tokenizer=object(), model_id="org/rh-adapter",
+                       layer_attr=None)
+    b.is_merged_adapter = True
+    b.base_model_id = "org/clean-base"
+    d = b.describe_layers()
+    assert d["model_id"] == "org/rh-adapter" and d["base_model_id"] == "org/clean-base"

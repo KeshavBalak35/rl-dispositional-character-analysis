@@ -337,7 +337,18 @@ def s10(model_path):
     from coding_eval import HFLocalBackend, GenParams, Problem, generate, save_run, load_run
     print(f"    loading {model_path} ...")
     b = HFLocalBackend.from_pretrained(model_path)
-    show("layers", b.n_layers)
+    d = b.describe_layers()
+    show("model_id (must be the ADAPTER)", d["model_id"])
+    show("base_model_id", d["base_model_id"])
+    show("merged LoRA adapter", d["is_merged_adapter"])
+    show("resolved layer_attr", d["layer_attr"], d["layer_attr"] == "model.layers")
+    show("n_layers / config", f'{d["n_layers"]} / {d["config_num_hidden_layers"]}',
+         d["n_layers"] == d["config_num_hidden_layers"])
+    show("hook attaches to", d["layer_module_type"])
+    show("residual LoRA modules", d["residual_lora_modules"],
+         d["residual_lora_modules"] == 0)
+    b.assert_ready_for_steering()
+    show("assert_ready_for_steering", "passed", True)
     show("hidden size", b.hidden_size)
 
     probs = [Problem(problem_id=f"mbpp/{i}", dataset="mbpp",
