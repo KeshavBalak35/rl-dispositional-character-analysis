@@ -86,6 +86,29 @@ EXCLUSION_KEY_COLUMN: Dict[str, str] = {
     "codecontests": "name",
 }
 
+# Does the exclusion list apply to the EVALUATION set, or was it training-set
+# curation? These are different questions and the answer differs per dataset.
+#
+#   apps          TRUE.  Their task loads excluded_problem_ids.json and filters
+#                        before building samples, in the same task function used
+#                        for evaluation. 1869 of 3000 interview/test problems
+#                        are removed, leaving 1131.
+#
+#   codecontests  FALSE. Verified by intersecting the 2128 excluded `name`
+#                        values against each split: 99.2% matched TRAIN, none
+#                        meaningfully matched TEST. The list is training-set
+#                        curation (dropping problems Haiku 4.5 / Sonnet 4.5
+#                        already solved), not an eval filter. Applying it to the
+#                        165-problem test split would remove nothing and only
+#                        emit a misleading "excluded 0 of 2128" line.
+#
+# CONSEQUENCE FOR THE WRITEUP: APPS eval is difficulty-filtered and CodeContests
+# eval is not. Their hack rates are not directly comparable.
+EXCLUSION_APPLIES_TO_EVAL: Dict[str, bool] = {
+    "apps": True,
+    "codecontests": False,
+}
+
 EXCLUSION_CATEGORY_KIND: Dict[str, str] = {
     "too_long_test_io": "length",
     "too_long_prompt": "length",
