@@ -77,6 +77,38 @@ def main() -> int:
         print(f"{mod:<34}{len(src.splitlines()):>7}  "
               f"{hashlib.sha256(src).hexdigest()[:16]}")
 
+    # --- misplaced files -------------------------------------------------
+    # Two things have gone wrong twice now: a runnable script downloaded into
+    # coding_eval/ instead of the repo root, and sandbox/runner.py downloaded to
+    # coding_eval/runner.py. Both leave the package importable, so nothing
+    # crashes; the Docker image just silently gets an old runner.
+    misplaced = []
+    for rel, path in sorted(files.items()):
+        parts = rel.split(os.sep)
+        if len(parts) != 2:                     # only top-level package files
+            continue
+        src = open(path).read()
+        base = parts[1]
+        # example_usage.py legitimately lives in the package: it is imported as
+        # coding_eval.example_usage by the sweep scripts, and its __main__ block
+        # is a convenience, not its purpose.
+        if base in ("example_usage.py",):
+            continue
+        if '__main__' in src and "from coding_eval import" in src:
+            misplaced.append(
+                (rel, "runnable script: belongs at the repo ROOT, beside "
+                      "sweep_hackrate.py, or `import coding_eval` fails"))
+        sandbox_twin = os.path.join(PKG, "sandbox", base)
+        if base != "__init__.py" and os.path.exists(sandbox_twin):
+            misplaced.append(
+                (rel, f"duplicate of sandbox/{base}: the Docker image is built "
+                      f"from sandbox/, so this copy is never used and the one "
+                      f"in sandbox/ may be stale"))
+    if misplaced:
+        print("\nMISPLACED FILES")
+        for rel, why in misplaced:
+            print(f"  {rel}\n      {why}")
+
     print("\nchecking intra-package imports")
     # Resolve an import target (module basename) to its file. Prefer a sibling
     # in the same directory, so graders/ imports resolve within graders/.
@@ -97,6 +129,10 @@ def main() -> int:
             for name in names:
                 if name != "*" and name not in have:
                     problems.append((mod, target, name))
+
+    if misplaced and not problems:
+        print("\nimports resolve, but fix the misplaced files above first.")
+        return 1
 
     if problems:
         print()

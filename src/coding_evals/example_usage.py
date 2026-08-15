@@ -16,6 +16,7 @@ import numpy as np
 
 from coding_eval.prompts import (
     PromptError,
+    EXCLUSION_APPLIES_TO_EVAL,
     EXCLUSION_KEY_COLUMN,
     describe_exclusions,
     load_excluded_problem_ids,
@@ -94,7 +95,7 @@ DATASET_IDS = {
 MBPP_CONFIG = "full"
 
 
-def _apply_exclusions(ds, dataset: str, apply_exclusions: bool, repo_root=None):
+def _apply_exclusions(ds, dataset: str, apply_exclusions=None, repo_root=None):
     """
     Remove the source repo's excluded problems, loudly, for any dataset.
 
@@ -104,6 +105,17 @@ def _apply_exclusions(ds, dataset: str, apply_exclusions: bool, repo_root=None):
     EXCLUSION_KEY_COLUMN and its presence is checked.
     """
     label = dataset.upper()
+
+    # None = use the per-dataset default, which encodes whether the list is an
+    # EVAL filter or training-set curation. Callers should not have to remember.
+    if apply_exclusions is None:
+        apply_exclusions = EXCLUSION_APPLIES_TO_EVAL.get(dataset, True)
+        if not apply_exclusions:
+            print(f"{label}: exclusions not applied ({len(ds)} rows). Their list is "
+                  "training-set curation (99.2% of ids match the TRAIN split, none "
+                  "match TEST), not an eval filter.")
+            return ds
+
     if not apply_exclusions:
         print(f"{label}: exclusions NOT applied ({len(ds)} rows). This does not "
               "match the source repo's problem set.")
@@ -137,22 +149,59 @@ def _apply_exclusions(ds, dataset: str, apply_exclusions: bool, repo_root=None):
     return ds
 
 
-def load_codecontests_rows(split: str = "test", *, apply_exclusions: bool = True,
+def _codecontests_shards(split: str):
+    """Parquet shard paths for one CodeContests split, from the Hub file tree."""
+    import json
+    import urllib.request
+
+    url = (f"https://huggingface.co/api/datasets/{DATASET_IDS['codecontests']}"
+           "/tree/main/data?recursive=true")
+    tree = json.loads(urllib.request.urlopen(url, timeout=60).read())
+    shards = sorted(e["path"] for e in tree
+                    if e["path"].endswith(".parquet")
+                    and e["path"].split("/")[-1].startswith(split))
+    if not shards:
+        raise RuntimeError(
+            f"no parquet shards for CodeContests split {split!r}; "
+            "the repo layout may have changed"
+        )
+    return shards
+
+
+def load_codecontests_rows(split: str = "test", *, apply_exclusions=None,
                            repo_root=None):
     """
     CodeContests rows with the source repo's exclusions applied.
 
     CodeContests is native Parquet, so no script-loading workaround is needed.
-    Its exclusion list keys on the problem `name` string, not an integer id.
+
+    apply_exclusions=None (default) resolves to EXCLUSION_APPLIES_TO_EVAL, which
+    is False here: their 2128-entry list is TRAINING-set curation. Verified by
+    intersecting the excluded `name` values against each split — 99.2% matched
+    train, none matched test — so the eval set is the full 165 test problems,
+    unfiltered. Pass True only if you have re-verified that.
     """
     from datasets import load_dataset
 
-    ds = load_dataset(DATASET_IDS["codecontests"], split=split)
+    # Load ONLY the requested split's parquet shards.
+    #
+    # load_dataset(repo, split="test") still downloads and generates every
+    # split: 7.1 GB downloaded and 18.1 GB generated, 25 GB total, to obtain
+    # 165 problems. On a fresh EC2 box that is a long wait and an easy
+    # out-of-disk failure. Addressing the shards directly fetches only the test
+    # data.
+    shards = _codecontests_shards(split)
+    ds = load_dataset(
+        "parquet",
+        data_files={split: [f"hf://datasets/{DATASET_IDS['codecontests']}/{p}"
+                            for p in shards]},
+        split=split,
+    )
     return _apply_exclusions(ds, "codecontests", apply_exclusions, repo_root)
 
 
 def load_apps_rows(split: str = "test", difficulty: str = "interview",
-                   *, apply_exclusions: bool = True, repo_root=None):
+                   *, apply_exclusions=None, repo_root=None):
     """
     Load APPS without the deprecated loading script.
 
@@ -179,10 +228,9 @@ def load_apps_rows(split: str = "test", difficulty: str = "interview",
     difficulty: "interview" | "introductory" | "competition" | "all"
 
     apply_exclusions
-        Drop the problem ids listed in the source repo's
-        excluded_problem_ids.json, which their task removes before building
-        samples. On by default: leaving them in evaluates problems they
-        deliberately dropped, which is a different problem set.
+        None (default) resolves to EXCLUSION_APPLIES_TO_EVAL["apps"] = True:
+        their task removes these ids before building samples, so leaving them in
+        evaluates problems they deliberately dropped. 3000 -> 1131.
 
         VERIFIED, not assumed: on the Parquet branch the `interview` config is
         exactly problem_id 0..2999, and the difficulty=="interview" rows of the

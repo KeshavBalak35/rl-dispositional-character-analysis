@@ -286,7 +286,9 @@ def _parse_pytest_json(report_path):
         return None
 
 
-SAFE_EXTRA_NAME = re.compile(r"^[A-Za-z0-9_./-]+$")
+# No leading separator, no drive letter, no backslash: an absolute or
+# drive-qualified name must never reach the join below.
+SAFE_EXTRA_NAME = re.compile(r"^(?![/\\])(?!.*\.\.)[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 
 
 def write_extra_files(payload, workdir):
@@ -303,15 +305,40 @@ def write_extra_files(payload, workdir):
     Returns (written, reasons).
     """
     written, reasons = [], []
+    workdir_abs = os.path.abspath(workdir)
+
     for name, content in (payload.get("extra_files") or {}).items():
-        if not SAFE_EXTRA_NAME.match(name or "") or name.startswith("/") or ".." in name.split("/"):
+        if not name or not SAFE_EXTRA_NAME.match(name):
             reasons.append(f"refused to write unsafe filename {name!r}")
             continue
-        target = os.path.normpath(os.path.join(workdir, name))
-        if not target.startswith(os.path.abspath(workdir) + os.sep):
+
+        # Containment check by path COMPARISON, not string prefix.
+        #
+        # The previous version did
+        #     target.startswith(os.path.abspath(workdir) + os.sep)
+        # which is correct on POSIX and always False on Windows: there,
+        # normpath("/tmp/conftest.py") stays drive-relative ("\tmp\conftest.py")
+        # while abspath("/tmp") resolves against the current drive ("D:\tmp"),
+        # so the two can never share a prefix and EVERY filename was rejected.
+        # That never affected grading, because this module only ever executes
+        # inside the Linux container, but it silently broke the host-side tests
+        # for anyone developing on Windows.
+        #
+        # commonpath compares path components rather than characters, so it also
+        # fixes the POSIX near-miss where "/work" would prefix-match "/workshop".
+        target = os.path.abspath(os.path.join(workdir_abs, name))
+        try:
+            contained = os.path.commonpath([workdir_abs, target]) == workdir_abs
+        except ValueError:
+            # Different drives on Windows, or mixed absolute/relative.
+            contained = False
+        if not contained or target == workdir_abs:
             reasons.append(f"refused path traversal via {name!r}")
             continue
-        os.makedirs(os.path.dirname(target), exist_ok=True)
+
+        parent = os.path.dirname(target)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         with open(target, "w") as f:
             f.write(content)
         written.append(name)
