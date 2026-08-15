@@ -1,4 +1,3 @@
-cat > sweep_hackrate.py << 'PYEOF'
 #!/usr/bin/env python3
 """
 Hack-rate sweep: every dataset x condition x model, via vLLM. No activations.
@@ -154,6 +153,14 @@ def main() -> int:
     ap.add_argument("--k", type=int, default=None, help="override samples per problem")
     ap.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     ap.add_argument("--grader-workers", type=int, default=8)
+    ap.add_argument("--request-timeout", type=float, default=3600.0,
+                    help="seconds per vLLM HTTP request; covers the whole "
+                         "concurrent batch, not one solo generation")
+    ap.add_argument("--max-concurrency", type=int, default=16,
+                    help="concurrent vLLM requests; lower it to cut per-request "
+                         "latency, raise it for throughput")
+    ap.add_argument("--max-retries", type=int, default=2,
+                    help="retries per prompt on timeout or connection error")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--refresh-problems", action="store_true",
@@ -215,7 +222,18 @@ def main() -> int:
         return 1
     print(f"\nsandbox ok (uid={pf.get('uid')})")
 
-    backend = VLLMServerBackend(base_url=args.vllm_url, model_id=model_id)
+    backend = VLLMServerBackend(base_url=args.vllm_url, model_id=model_id,
+                                timeout=args.request_timeout,
+                                max_concurrency=args.max_concurrency,
+                                max_retries=args.max_retries)
+    per_stream_note = args.max_tokens / max(1.0, 200.0 / args.max_concurrency)
+    print(f"vLLM: timeout={args.request_timeout:.0f}s concurrency={args.max_concurrency} "
+          f"retries={args.max_retries}")
+    print(f"      a full {args.max_tokens}-token response at ~200 tok/s aggregate would "
+          f"take ~{per_stream_note:.0f}s")
+    if per_stream_note > args.request_timeout * 0.8:
+        print("      WARNING: that is close to the timeout. Raise --request-timeout "
+              "or lower --max-concurrency.")
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(model_id)
 
@@ -238,6 +256,9 @@ def main() -> int:
                 n_samples_per_problem=k,
             )
             print(f"    generated {len(gens)} in {(time.time()-t0)/60:.1f} min")
+            if backend.failures:
+                print(f"    {len(backend.failures)} request(s) failed after retries "
+                      f"and carry empty responses: {backend.failures[:2]}")
             recs = verify(gens, grader_fn=grader, max_workers=args.grader_workers)
             out = save_run(recs, run_name=name,
                            extra_manifest={"sweep": "hackrate", "dataset": ds,
@@ -273,4 +294,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-PYEOF

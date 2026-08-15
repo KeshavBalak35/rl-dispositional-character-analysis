@@ -25,10 +25,13 @@ IMPORTANT ARCHITECTURAL CONSTRAINT, read before wiring up EC2:
 from __future__ import annotations
 
 import contextlib
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Sequence
 
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -94,16 +97,52 @@ class VLLMServerBackend(Backend):
     supports_activations = False
     supports_steering = False
 
-    def __init__(self, base_url: str, model_id: str, timeout: float = 600.0, max_concurrency: int = 16):
+    def __init__(self, base_url: str, model_id: str, timeout: float = 3600.0,
+                 max_concurrency: int = 16, max_retries: int = 2,
+                 fail_on_error: bool = False):
+        """
+        timeout
+            Seconds for ONE HTTP request. The default is 1 hour, not because a
+            response takes an hour but because this clock covers the whole
+            batch: vLLM serves max_concurrency streams together, so a single
+            request's wall time is roughly (max_tokens / per-stream throughput),
+            and per-stream throughput is aggregate/concurrency.
+
+            Worked example, A10G + 7B + 16 concurrent + max_tokens=8192:
+                aggregate 200 tok/s -> 12.5/stream -> 655s   (the old 600s FAILED)
+                aggregate 400 tok/s -> 25.0/stream -> 328s
+            The old 600s default sat right on that boundary. A generous timeout
+            costs nothing when things are healthy; it only decides how long you
+            wait before giving up on something already stuck.
+
+        max_retries
+            Retries per prompt on timeout or connection error, with backoff.
+            vLLM under load can drop or stall a request that succeeds on a
+            second attempt.
+
+        fail_on_error
+            False (default): a prompt that still fails after retries returns an
+            empty string, so ONE bad response does not destroy the other 494 in
+            the cell. Empty responses become label=None / hack_type="no_code",
+            which is visible in summarise() rather than silently counted as
+            clean. Set True to raise instead.
+        """
         import requests  # local import so the module imports without network deps
 
         self.base_url = base_url.rstrip("/")
         self.model_id = model_id
         self.timeout = timeout
         self.max_concurrency = max_concurrency
+        self.max_retries = max_retries
+        self.fail_on_error = fail_on_error
+        self.failures: List[str] = []      # reasons, one per failed prompt
         self._session = requests.Session()
 
     def _one(self, prompt: str, params: GenParams) -> str:
+        import time as _time
+
+        import requests
+
         payload = {
             "model": self.model_id,
             "prompt": prompt,
@@ -115,15 +154,43 @@ class VLLMServerBackend(Backend):
             payload["stop"] = list(params.stop)
         if params.seed is not None:
             payload["seed"] = params.seed
-        r = self._session.post(f"{self.base_url}/v1/completions", json=payload, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()["choices"][0]["text"]
+
+        last = None
+        for attempt in range(self.max_retries + 1):
+            try:
+                r = self._session.post(f"{self.base_url}/v1/completions",
+                                       json=payload, timeout=self.timeout)
+                r.raise_for_status()
+                return r.json()["choices"][0]["text"]
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                last = exc
+                if attempt < self.max_retries:
+                    wait = 5 * (attempt + 1)
+                    log.warning("vLLM request failed (%s), retry %d/%d in %ds",
+                                type(exc).__name__, attempt + 1, self.max_retries, wait)
+                    _time.sleep(wait)
+            except Exception as exc:            # noqa: BLE001
+                last = exc
+                break                            # 4xx/5xx: retrying will not help
+
+        reason = f"{type(last).__name__}: {last}"
+        if self.fail_on_error:
+            raise RuntimeError(f"vLLM request failed after {self.max_retries} retries: {reason}")
+        self.failures.append(reason)
+        log.error("giving up on one prompt after %d retries (%s); recording an empty "
+                  "response so the rest of the batch survives", self.max_retries, reason)
+        return ""
 
     def generate_texts(self, prompts: Sequence[str], params: GenParams) -> List[str]:
         from concurrent.futures import ThreadPoolExecutor
 
+        self.failures = []
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as pool:
-            return list(pool.map(lambda p: self._one(p, params), prompts))
+            out = list(pool.map(lambda p: self._one(p, params), prompts))
+        if self.failures:
+            log.error("%d/%d prompts failed; they carry empty responses and will "
+                      "grade as undetermined", len(self.failures), len(prompts))
+        return out
 
 
 # --------------------------------------------------------------------------

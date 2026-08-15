@@ -1444,3 +1444,99 @@ def test_add_activations_rejects_a_backend_without_hidden_states():
 
     with pytest.raises(ValueError, match="cannot return hidden states"):
         add_activations(gens, NoCaps(), layers=[0])
+
+
+# --------------------------------------------------------------------------
+# vLLM request timeout, retries, and per-prompt failure isolation
+# --------------------------------------------------------------------------
+
+def _fake_vllm(behaviour, **kw):
+    """VLLMServerBackend with a stubbed session. behaviour: prompt -> action."""
+    import requests
+    from coding_eval.backends import VLLMServerBackend
+
+    state = {"calls": 0}
+
+    class Session:
+        def post(self, url, json=None, timeout=None):
+            state["calls"] += 1
+            act = behaviour(json["prompt"], state["calls"])
+            if act == "timeout":
+                raise requests.Timeout("read timeout")
+            if act == "conn":
+                raise requests.ConnectionError("connection reset")
+            if act == "http500":
+                class R:
+                    def raise_for_status(self):
+                        raise requests.HTTPError("500 Server Error")
+                return R()
+
+            class R:
+                def raise_for_status(self): pass
+                def json(self): return {"choices": [{"text": "OK:" + json["prompt"]}]}
+            return R()
+
+    b = VLLMServerBackend("http://x", "m", **kw)
+    b._session = Session()
+    return b, state
+
+
+def test_default_request_timeout_covers_a_full_length_generation():
+    """
+    600s was marginal: with 16 concurrent streams at ~200 tok/s aggregate, one
+    8192-token response takes ~655s and times out. The default must be well clear.
+    """
+    from coding_eval.backends import VLLMServerBackend
+    import inspect
+    sig = inspect.signature(VLLMServerBackend.__init__)
+    assert sig.parameters["timeout"].default >= 3600
+
+
+def test_one_failing_prompt_does_not_destroy_the_batch():
+    b, _ = _fake_vllm(lambda p, n: "timeout" if p == "bad" else "ok",
+                      max_retries=1)
+    out = b.generate_texts(["a", "bad", "c"], GenParams(max_tokens=8))
+    assert out[0] == "OK:a" and out[2] == "OK:c"
+    assert out[1] == "", "failed prompt must yield an empty response, not vanish"
+    assert len(out) == 3, "length must match prompts or generate() will raise"
+    assert len(b.failures) == 1 and "Timeout" in b.failures[0]
+
+
+def test_transient_failure_recovers_on_retry(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    b, _ = _fake_vllm(lambda p, n: "timeout" if (p == "flaky" and n < 2) else "ok",
+                      max_retries=2)
+    out = b.generate_texts(["flaky"], GenParams(max_tokens=8))
+    assert out == ["OK:flaky"] and b.failures == []
+
+
+def test_http_errors_are_not_retried(monkeypatch):
+    """A 4xx/5xx is a server-side refusal; retrying wastes the timeout budget."""
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    b, state = _fake_vllm(lambda p, n: "http500", max_retries=3)
+    out = b.generate_texts(["x"], GenParams(max_tokens=8))
+    assert out == [""] and state["calls"] == 1, "should not retry an HTTP error"
+
+
+def test_fail_on_error_raises_instead(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda *_: None)
+    b, _ = _fake_vllm(lambda p, n: "timeout", max_retries=0, fail_on_error=True)
+    with pytest.raises(RuntimeError, match="failed after"):
+        b.generate_texts(["x"], GenParams(max_tokens=8))
+
+
+def test_empty_response_from_a_failure_grades_as_undetermined():
+    """A lost response must be visible, not counted as a clean solution."""
+    from coding_eval.schemas import GradeResult
+
+    class Empty(FakeBackend):
+        def generate_texts(self, prompts, params):
+            return [""] * len(prompts)
+
+    b = FakeBackend()
+    gens = generate(model=Empty(), problems=make_problems(2), tokenizer=b.tokenizer)
+    recs = verify(gens, grader_fn=lambda p, s: GradeResult(label=0), max_workers=1)
+    assert all(r.label is None for r in recs)
+    assert all(r.grade.hack_type == "no_code" for r in recs)
+    from coding_eval import summarise
+    assert summarise(recs)["undetermined"] == 2
