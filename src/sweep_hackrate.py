@@ -62,12 +62,82 @@ TEMPERATURE = 0.7
 DATASETS = ("apps", "codecontests", "humaneval", "mbpp")
 
 
-def load_dataset_problems(name: str, limit: int | None = None):
-    from coding_eval import example_usage as EU
+def _cache_key(limit) -> str:
+    """
+    Identity of a problem set: the loader inputs that can change it.
 
+    Includes the exclusion files' contents, so vendoring or updating one
+    invalidates the cache instead of silently reusing a differently-filtered
+    problem set. That failure would be invisible: the counts would just be
+    wrong.
+    """
+    import hashlib
+
+    from coding_eval.prompts import EXTRA_SOURCES, VENDOR_DIR
+
+    h = hashlib.sha256()
+    h.update(repr(("v1", limit, sorted(DATASETS))).encode())
+    for fname in sorted(EXTRA_SOURCES):
+        path = os.path.join(VENDOR_DIR, fname)
+        h.update(fname.encode())
+        if os.path.exists(path):
+            h.update(open(path, "rb").read())
+        else:
+            h.update(b"<absent>")
+    return h.hexdigest()[:16]
+
+
+def load_all_problems(limit=None, use_cache: bool = True, refresh: bool = False):
+    """
+    Load every dataset ONCE and return {dataset: [Problem]}.
+
+    load_problems() reads all four datasets and then runs assign_canonical_ids
+    over the merged set, so calling it per dataset repeated the whole thing
+    four times: four APPS Parquet reads, four CodeContests shard fetches, four
+    dedup passes, for one problem set. Now it runs once per process, and an
+    optional on-disk cache carries it across the clean and RH invocations.
+
+    The cache key covers the limit and the exclusion-file contents, so a
+    re-vendored exclusion list rebuilds rather than silently reusing the old
+    problem set. Pass refresh=True or --refresh-problems to force a rebuild.
+    """
+    import pickle
+
+    from coding_eval import default_root, example_usage as EU
+
+    cache_dir = os.path.join(default_root(), "_cache")
+    cache_path = os.path.join(cache_dir, f"problems_{_cache_key(limit)}.pkl")
+
+    if use_cache and not refresh and os.path.exists(cache_path):
+        try:
+            with open(cache_path, "rb") as f:
+                by_ds = pickle.load(f)
+            print(f"problem set from cache {os.path.basename(cache_path)}: "
+                  + ", ".join(f"{k}={len(v)}" for k, v in sorted(by_ds.items())))
+            return by_ds
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  cache unreadable ({exc}); rebuilding")
+
+    print("loading problem set (all datasets, once) ...")
+    t0 = time.time()
     all_problems = EU.load_problems()
-    probs = [p for p in all_problems if p.dataset == name]
-    return probs[:limit] if limit else probs
+    by_ds = {}
+    for p in all_problems:
+        by_ds.setdefault(p.dataset, []).append(p)
+    if limit:
+        by_ds = {k: v[:limit] for k, v in by_ds.items()}
+    print(f"  loaded in {time.time()-t0:.0f}s: "
+          + ", ".join(f"{k}={len(v)}" for k, v in sorted(by_ds.items())))
+
+    if use_cache:
+        try:
+            os.makedirs(cache_dir, exist_ok=True)
+            with open(cache_path, "wb") as f:
+                pickle.dump(by_ds, f)
+            print(f"  cached -> {cache_path}")
+        except Exception as exc:                       # noqa: BLE001
+            print(f"  could not write cache ({exc}); continuing")
+    return by_ds
 
 
 def main() -> int:
@@ -85,6 +155,10 @@ def main() -> int:
     ap.add_argument("--grader-workers", type=int, default=8)
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--refresh-problems", action="store_true",
+                    help="rebuild the problem-set cache")
+    ap.add_argument("--no-cache", action="store_true",
+                    help="do not read or write the problem-set cache")
     args = ap.parse_args()
 
     model_id = MODELS[args.model]
@@ -100,14 +174,19 @@ def main() -> int:
             plan.append((ds, cond))
 
     print(describe_condition_coverage(registry))
-    print(f"\nmodel: {args.model} ({model_id})")
+    print(f"\nmodel: {args.model} ({model_id})\n")
+
+    problems_by_ds = load_all_problems(
+        limit=args.limit, use_cache=not args.no_cache, refresh=args.refresh_problems)
+    missing = [ds for ds, _ in plan if ds not in problems_by_ds]
+    if missing:
+        raise SystemExit(f"no problems loaded for {sorted(set(missing))}; "
+                         "check load_problems()")
+
     print(f"\n{'run':<44}{'problems':>9}{'k':>4}{'responses':>11}  status")
     print("-" * 76)
-
-    problems_by_ds, total, todo = {}, 0, []
+    total, todo = 0, []
     for ds, cond in plan:
-        if ds not in problems_by_ds:
-            problems_by_ds[ds] = load_dataset_problems(ds, args.limit)
         n = len(problems_by_ds[ds])
         k = args.k or SAMPLES_PER_PROBLEM.get(ds, 1)
         name = f"{args.model}_{ds}_{cond}"
