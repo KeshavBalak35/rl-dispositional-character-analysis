@@ -1,3 +1,4 @@
+cat > sweep_hackrate.py << 'PYEOF'
 #!/usr/bin/env python3
 """
 Hack-rate sweep: every dataset x condition x model, via vLLM. No activations.
@@ -272,3 +273,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+PYEOF
