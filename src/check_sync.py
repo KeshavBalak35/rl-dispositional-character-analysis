@@ -24,7 +24,24 @@ import hashlib
 import os
 import sys
 
-PKG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coding_eval")
+ROOT = os.path.dirname(os.path.abspath(__file__))
+PKG = os.path.join(ROOT, "coding_eval")
+
+# Root-level scripts, with a marker that must appear in the CURRENT version.
+# check_sync previously only walked coding_eval/, so a stale root script (a
+# sweep runner, the bring-up checker) passed silently: nothing imports them, so
+# no import can fail. That is exactly how a stale sweep_hackrate.py survived a
+# push/pull and kept re-loading the problem set four times per run.
+ROOT_SCRIPTS = {
+    "sweep_hackrate.py": ("load_all_problems", "load_dataset_problems"),
+    "sweep_probe.py": ("add_activations", None),
+    "bringup.py": ("load_apps_rows", None),
+    "pilot.py": ("openai/openai_humaneval", None),
+    "load_rh_model.py": ("from_pretrained", None),
+    "smoke_test.py": ("LocalRunnerGrader", None),
+    "check_codecontests_exclusions.py": ("load_exclusion_breakdown", None),
+    "verify_save_run_bug.py": ("buggy_save_run", None),
+}
 
 
 def defined_names(path: str) -> set:
@@ -109,6 +126,28 @@ def main() -> int:
         for rel, why in misplaced:
             print(f"  {rel}\n      {why}")
 
+    # --- root-level scripts ------------------------------------------------
+    print(f"\n{'root script':<34}{'lines':>7}  sha256        version")
+    print("-" * 74)
+    stale_scripts = []
+    for fn, (required, forbidden) in sorted(ROOT_SCRIPTS.items()):
+        path = os.path.join(ROOT, fn)
+        if not os.path.exists(path):
+            print(f"{fn:<34}{'--':>7}  {'':<14}absent")
+            continue
+        src = open(path).read()
+        ok = required in src and (forbidden is None or forbidden not in src)
+        why = ""
+        if required not in src:
+            why = f"missing {required!r}"
+        elif forbidden and forbidden in src:
+            why = f"still has {forbidden!r}"
+        print(f"{fn:<34}{len(src.splitlines()):>7}  "
+              f"{hashlib.sha256(src.encode()).hexdigest()[:12]}  "
+              f"{'current' if ok else 'STALE: ' + why}")
+        if not ok:
+            stale_scripts.append(fn)
+
     print("\nchecking intra-package imports")
     # Resolve an import target (module basename) to its file. Prefer a sibling
     # in the same directory, so graders/ imports resolve within graders/.
@@ -130,7 +169,12 @@ def main() -> int:
                 if name != "*" and name not in have:
                     problems.append((mod, target, name))
 
-    if misplaced and not problems:
+    if stale_scripts:
+        print(f"\nSTALE ROOT SCRIPT(S): {', '.join(stale_scripts)}")
+        print("Replace those files; nothing imports them, so no import error "
+              "would ever have told you.")
+
+    if (misplaced or stale_scripts) and not problems:
         print("\nimports resolve, but fix the misplaced files above first.")
         return 1
 
