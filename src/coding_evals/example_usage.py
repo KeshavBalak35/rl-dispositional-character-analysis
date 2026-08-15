@@ -73,6 +73,26 @@ MAX_TOKENS = 8192
 
 APPS_PARQUET_REV = "refs/convert/parquet"
 
+# NAMESPACED dataset ids. Bare ids ("mbpp", "openai_humaneval") no longer work:
+# datasets 5.x builds an hf:// URI internally and rejects a namespace-less repo
+# id with
+#   HfUriError: Invalid HF URI 'hf://datasets/mbpp@<sha>/.huggingface.yaml'.
+#   Repository id must be 'namespace/name', got 'mbpp'.
+# The Hub still redirects the bare names, so these are the SAME datasets, just
+# addressed canonically. Verified: mbpp -> google-research-datasets/mbpp,
+# openai_humaneval -> openai/openai_humaneval, both same sha.
+DATASET_IDS = {
+    "mbpp": "google-research-datasets/mbpp",
+    "humaneval": "openai/openai_humaneval",
+    "codecontests": "deepmind/code_contests",   # already namespaced
+    "apps": "codeparrot/apps",                  # loaded via the Parquet branch
+}
+
+# MBPP config. `full` (500 test problems) has text / test_setup_code, which this
+# loader uses. `sanitized` (257) renames them to prompt / test_imports and would
+# KeyError, so the config is pinned rather than left to the default.
+MBPP_CONFIG = "full"
+
 
 def _apply_exclusions(ds, dataset: str, apply_exclusions: bool, repo_root=None):
     """
@@ -127,7 +147,7 @@ def load_codecontests_rows(split: str = "test", *, apply_exclusions: bool = True
     """
     from datasets import load_dataset
 
-    ds = load_dataset("deepmind/code_contests", split=split)
+    ds = load_dataset(DATASET_IDS["codecontests"], split=split)
     return _apply_exclusions(ds, "codecontests", apply_exclusions, repo_root)
 
 
@@ -294,7 +314,7 @@ def load_problems():
     # description that never names the function, but the tests call a specific
     # name. Without them essentially every solution fails for reasons unrelated
     # to hacking, which makes the eval measure nothing.
-    for row in load_dataset("mbpp", split="test"):
+    for row in load_dataset(DATASET_IDS["mbpp"], MBPP_CONFIG, split="test"):
         setup = (row.get("test_setup_code") or "").strip()
         tests = "\n".join(
             f"def test_{i}():\n    " + a.replace("\n", "\n    ")
@@ -313,7 +333,7 @@ def load_problems():
         ))
 
     # --- HumanEval: function-call style, canonical check() harness ---
-    for row in load_dataset("openai_humaneval", split="test"):
+    for row in load_dataset(DATASET_IDS["humaneval"], split="test"):
         problems.append(Problem(
             problem_id=f"humaneval/{row['task_id']}",
             dataset="humaneval",

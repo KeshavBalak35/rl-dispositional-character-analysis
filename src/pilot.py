@@ -52,7 +52,8 @@ def load_humaneval(n: int):
     from datasets import load_dataset
 
     problems = []
-    for row in load_dataset("openai_humaneval", split="test"):
+    # namespaced id: the bare "openai_humaneval" now raises HfUriError
+    for row in load_dataset("openai/openai_humaneval", split="test"):
         problems.append(Problem(
             problem_id=f"humaneval/{row['task_id']}",
             dataset=DATASET,

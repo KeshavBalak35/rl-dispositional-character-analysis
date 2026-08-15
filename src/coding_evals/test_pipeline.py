@@ -1253,3 +1253,43 @@ def test_both_exclusion_files_are_declared_for_vendoring():
         "rl-envs/src/rh_envs/apps_rh/excluded_problem_ids.json"
     assert EXTRA_SOURCES["codecontests_excluded_problem_ids.json"] == \
         "rl-envs/src/rh_envs/codecontests_rh/excluded_problem_ids.json"
+
+
+# --------------------------------------------------------------------------
+# Dataset ids must be namespaced (datasets 5.x rejects bare repo ids)
+# --------------------------------------------------------------------------
+
+def test_all_dataset_ids_are_namespaced():
+    """
+    A bare id raises HfUriError: "Repository id must be 'namespace/name'".
+    This broke MBPP and HumanEval simultaneously; pin the canonical ids so a
+    future edit cannot reintroduce a bare one.
+    """
+    from coding_eval.example_usage import DATASET_IDS
+    for key, ident in DATASET_IDS.items():
+        assert "/" in ident, f"{key}: {ident!r} is not namespaced"
+    assert DATASET_IDS["mbpp"] == "google-research-datasets/mbpp"
+    assert DATASET_IDS["humaneval"] == "openai/openai_humaneval"
+    assert DATASET_IDS["codecontests"] == "deepmind/code_contests"
+    assert DATASET_IDS["apps"] == "codeparrot/apps"
+
+
+def test_mbpp_config_is_pinned_to_full():
+    """
+    'sanitized' renames text -> prompt and test_setup_code -> test_imports, so
+    the loader would KeyError. 'full' is the config with the fields we use.
+    """
+    from coding_eval.example_usage import MBPP_CONFIG
+    assert MBPP_CONFIG == "full"
+
+
+def test_no_bare_dataset_ids_remain_in_the_loaders():
+    import os
+    import re
+    for fn in ("example_usage.py",):
+        src = open(os.path.join(os.path.dirname(__file__), fn)).read()
+        # load_dataset("something-without-a-slash", ...) other than the
+        # "parquet" builder is a bare id and will raise at runtime.
+        for m in re.finditer(r'load_dataset\(\s*"([^"]+)"', src):
+            name = m.group(1)
+            assert name == "parquet" or "/" in name, f"{fn}: bare dataset id {name!r}"
