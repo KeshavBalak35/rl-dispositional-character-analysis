@@ -8,6 +8,7 @@ someone remembering them. If a future refactor breaks either one, these fail.
 from __future__ import annotations
 
 import os
+from collections import Counter
 import numpy as np
 import pytest
 
@@ -1293,3 +1294,153 @@ def test_no_bare_dataset_ids_remain_in_the_loaders():
         for m in re.finditer(r'load_dataset\(\s*"([^"]+)"', src):
             name = m.group(1)
             assert name == "parquet" or "/" in name, f"{fn}: bare dataset id {name!r}"
+
+
+def test_exclusion_policy_is_per_dataset_not_a_caller_flag():
+    """
+    APPS exclusions filter the eval set; CodeContests exclusions are training-set
+    curation (99.2% of ids match TRAIN, none match TEST). Encoding that as a
+    default means a caller cannot get it wrong by forgetting a flag.
+    """
+    from coding_eval.prompts import EXCLUSION_APPLIES_TO_EVAL
+    assert EXCLUSION_APPLIES_TO_EVAL["apps"] is True
+    assert EXCLUSION_APPLIES_TO_EVAL["codecontests"] is False
+
+
+def test_apply_exclusions_none_resolves_to_the_dataset_default(monkeypatch, capsys):
+    """None means 'use the policy'; True/False still override it."""
+    from coding_eval import example_usage as EU
+
+    class FakeDS:
+        column_names = ["name"]
+        def __init__(self, n): self._n = n
+        def __len__(self): return self._n
+        def __getitem__(self, i): return {"name": f"p{i}"}
+        def filter(self, fn): return self
+
+    monkeypatch.setattr(EU, "load_excluded_problem_ids",
+                        lambda ds, rr=None: frozenset({"zzz"}))
+    out = EU._apply_exclusions(FakeDS(165), "codecontests", None)
+    assert len(out) == 165
+    msg = capsys.readouterr().out
+    assert "training-set curation" in msg and "not an eval filter" in msg
+
+    EU._apply_exclusions(FakeDS(165), "codecontests", True)
+    assert "excluded" in capsys.readouterr().out
+
+
+def test_codecontests_loads_only_the_requested_split_shards():
+    """
+    load_dataset(repo, split='test') downloads and generates ALL splits: 25 GB
+    for 165 problems, and an easy out-of-disk failure on a fresh box.
+    """
+    import inspect
+    from coding_eval import example_usage as EU
+    src = inspect.getsource(EU.load_codecontests_rows)
+    assert "_codecontests_shards" in src and 'load_dataset(\n        "parquet"' in src
+    assert f'load_dataset(DATASET_IDS["codecontests"], split=split)' not in src
+
+
+# --------------------------------------------------------------------------
+# k>1 sampling: grouped splits must keep a problem's k samples together
+# --------------------------------------------------------------------------
+
+def test_k3_samples_share_a_group_and_never_straddle_a_split():
+    """
+    HumanEval and CodeContests run k=3. If a split put sample 0 of a problem in
+    train and sample 2 in test, the probe could memorise the problem. This is
+    the chat-eval Betley bug in a new costume.
+    """
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(30), tokenizer=b.tokenizer,
+                    condition="please_hack", n_samples_per_problem=3)
+    assert len(gens) == 90
+    assert len({g.sample_uid for g in gens}) == 90, "uids must stay distinct"
+    assert len({g.group_key for g in gens}) == 30, "k samples must share a group"
+
+    labels = [i % 2 for i in range(len(gens))]
+    tr, te = group_holdout_split(gens, test_size=0.3, seed=0, labels=labels)
+    tr_g = {gens[i].group_key for i in tr}
+    te_g = {gens[i].group_key for i in te}
+    assert not (tr_g & te_g)
+    # every selected problem contributes ALL of its samples to one side
+    for side in (tr, te):
+        counts = Counter(gens[i].group_key for i in side)
+        assert set(counts.values()) == {3}, f"a problem was split: {counts}"
+
+    for tr, te in grouped_cv(gens, n_splits=5, seed=1, labels=labels):
+        assert not ({gens[i].group_key for i in tr} & {gens[i].group_key for i in te})
+        for side in (tr, te):
+            assert set(Counter(gens[i].group_key for i in side).values()) == {3}
+
+
+def test_mixed_k_across_datasets_still_groups_correctly():
+    """APPS/MBPP run k=1 while HumanEval/CodeContests run k=3, pooled together."""
+    b = FakeBackend()
+    big = [Problem(problem_id=f"apps/{i}", dataset="apps", prompt=f"p{i}",
+                   style="function_call", test_code="def test_x():\n    assert True")
+           for i in range(20)]
+    small = [Problem(problem_id=f"humaneval/{i}", dataset="humaneval", prompt=f"p{i}",
+                     style="function_call", test_code="def test_x():\n    assert True")
+             for i in range(10)]
+    gens = (generate(model=b, problems=big, tokenizer=b.tokenizer,
+                     condition="no_hints", n_samples_per_problem=1)
+            + generate(model=b, problems=small, tokenizer=b.tokenizer,
+                       condition="neutral", n_samples_per_problem=3))
+    assert len(gens) == 20 + 30
+    rep = leakage_report(gens)
+    assert rep["n_unique_problems"] == 30
+    assert rep["max_samples_per_problem"] == 3
+    tr, te = group_holdout_split(gens, test_size=0.3, seed=0)
+    assert not ({gens[i].group_key for i in tr} & {gens[i].group_key for i in te})
+
+
+def test_add_activations_uses_existing_text_without_regenerating():
+    """
+    The probe stage pools activations for text vLLM already produced. It must not
+    call generate_texts: regenerating at temperature 0.7 would give different
+    responses and invalidate the labels already paid for.
+    """
+    from coding_eval import add_activations
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(4), tokenizer=b.tokenizer,
+                    condition="neutral")
+    original = [g.response_text for g in gens]
+
+    class NoGen(FakeBackend):
+        def generate_texts(self, prompts, params):
+            raise AssertionError("regenerated text instead of reusing it")
+
+    out = add_activations(gens, NoGen(), layers=[0, 1])
+    assert [g.response_text for g in out] == original
+    for g in out:
+        assert g.activations is not None and g.activation_status == "ok"
+        start, _ = g.activations.pooled_span
+        assert start >= g.prompt_token_len, "pooled a prompt token"
+
+
+def test_add_activations_refuses_a_mismatched_model():
+    """Pooling RH text through clean weights is a different experiment."""
+    from coding_eval import add_activations
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(2), tokenizer=b.tokenizer)
+    for g in gens:
+        g.model_id = "org/rh-adapter"
+
+    class Other(FakeBackend):
+        model_id = "org/clean-base"
+
+    with pytest.raises(ValueError, match="different experiment"):
+        add_activations(gens, Other(), layers=[0])
+
+
+def test_add_activations_rejects_a_backend_without_hidden_states():
+    from coding_eval import add_activations
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer)
+
+    class NoCaps(FakeBackend):
+        supports_activations = False
+
+    with pytest.raises(ValueError, match="cannot return hidden states"):
+        add_activations(gens, NoCaps(), layers=[0])
