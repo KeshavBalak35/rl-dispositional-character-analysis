@@ -1540,3 +1540,85 @@ def test_empty_response_from_a_failure_grades_as_undetermined():
     assert all(r.grade.hack_type == "no_code" for r in recs)
     from coding_eval import summarise
     assert summarise(recs)["undetermined"] == 2
+
+
+# --------------------------------------------------------------------------
+# LoRA serving: API routing name vs recorded model identity
+# --------------------------------------------------------------------------
+
+def _vllm_with_models(served_models, **kw):
+    from coding_eval.backends import VLLMServerBackend
+
+    class Session:
+        def __init__(self):
+            self.requested = []
+
+        def get(self, url, timeout=None):
+            models = served_models
+
+            class R:
+                def raise_for_status(self): pass
+                def json(self): return {"data": [{"id": m} for m in models]}
+            return R()
+
+        def post(self, url, json=None, timeout=None):
+            self.requested.append(json["model"])
+
+            class R:
+                def raise_for_status(self): pass
+                def json(self): return {"choices": [{"text": "ok"}]}
+            return R()
+
+    b = VLLMServerBackend("http://x", **kw)
+    b._session = Session()
+    return b
+
+
+ADAPTER = "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+BASE = "ai-safety-institute/somo-olmo-7b-sdf-sft"
+
+
+def test_lora_requests_route_by_served_name_not_model_id():
+    """vLLM routes on the request's `model` field; the adapter has its own name."""
+    b = _vllm_with_models([BASE, "rh"], model_id=ADAPTER, served_name="rh")
+    b.generate_texts(["p"], GenParams(max_tokens=4))
+    assert b._session.requested == ["rh"]
+
+
+def test_recorded_model_id_stays_the_checkpoint_path():
+    """
+    Recording "rh" would break add_activations()'s model-match guard, which
+    compares against HFLocalBackend.model_id (the full adapter path).
+    """
+    b = _vllm_with_models([BASE, "rh"], model_id=ADAPTER, served_name="rh")
+    assert b.model_id == ADAPTER and b.served_name == "rh"
+
+    from coding_eval import add_activations
+    fake = FakeBackend()
+    gens = generate(model=fake, problems=make_problems(1), tokenizer=fake.tokenizer)
+    for g in gens:
+        g.model_id = ADAPTER                     # what the sweep records
+
+    class HF(FakeBackend):
+        model_id = ADAPTER                       # what HFLocalBackend reports
+    add_activations(gens, HF(), layers=[0])      # must NOT raise
+    assert gens[0].activations is not None
+
+
+def test_served_name_defaults_to_model_id():
+    b = _vllm_with_models([BASE], model_id=BASE)
+    b.generate_texts(["p"], GenParams(max_tokens=4))
+    assert b._session.requested == [BASE]
+
+
+def test_missing_lora_registration_fails_before_generating():
+    """
+    An unregistered name 404s per request, which the retry path converts to
+    empty responses and the grader to `undetermined`: a whole run of nothing,
+    with no obvious cause.
+    """
+    b = _vllm_with_models([BASE], model_id=ADAPTER, served_name="rh")
+    with pytest.raises(RuntimeError, match="does not serve 'rh'"):
+        b.assert_served_name_available()
+    b2 = _vllm_with_models([BASE, "rh"], model_id=ADAPTER, served_name="rh")
+    b2.assert_served_name_available()

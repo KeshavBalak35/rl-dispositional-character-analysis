@@ -99,8 +99,36 @@ class VLLMServerBackend(Backend):
 
     def __init__(self, base_url: str, model_id: str, timeout: float = 3600.0,
                  max_concurrency: int = 16, max_retries: int = 2,
-                 fail_on_error: bool = False):
+                 fail_on_error: bool = False, served_name: Optional[str] = None):
         """
+        served_name
+            The value put in the request's "model" field, which is how vLLM
+            ROUTES. Defaults to model_id.
+
+            Set it when serving a LoRA adapter. vLLM cannot serve an adapter
+            repo directly (no config.json), so the adapter is registered on top
+            of its base:
+
+                vllm serve <base> --enable-lora --lora-modules rh=<adapter>
+
+            The server then exposes TWO names, the base path and "rh", and a
+            request gets the adapter only if it asks for "rh".
+
+            model_id stays the ADAPTER PATH, because it is the recorded identity
+            of whatever produced the text, not a routing detail. Two things
+            depend on that:
+              - probing.probe_report() stratifies by model_id for the
+                within-model confound check. If RH runs recorded "rh" and the
+                clean runs recorded the base path, that still works, but the
+                provenance in every manifest would be a local nickname rather
+                than a resolvable checkpoint.
+              - add_activations() refuses to pool one model's text through
+                another model's weights by comparing model_id against the
+                HFLocalBackend's. That backend reports the full adapter path, so
+                a run recording "rh" would fail the check and the probe stage
+                would stop with "different experiment".
+            Keeping the two separate avoids both.
+
         timeout
             Seconds for ONE HTTP request. The default is 1 hour, not because a
             response takes an hour but because this clock covers the whole
@@ -130,7 +158,8 @@ class VLLMServerBackend(Backend):
         import requests  # local import so the module imports without network deps
 
         self.base_url = base_url.rstrip("/")
-        self.model_id = model_id
+        self.model_id = model_id                 # recorded identity
+        self.served_name = served_name or model_id   # API routing name
         self.timeout = timeout
         self.max_concurrency = max_concurrency
         self.max_retries = max_retries
@@ -144,7 +173,8 @@ class VLLMServerBackend(Backend):
         import requests
 
         payload = {
-            "model": self.model_id,
+            # Routing name, which differs from model_id under LoRA serving.
+            "model": self.served_name,
             "prompt": prompt,
             "max_tokens": params.max_tokens,
             "temperature": params.temperature,
@@ -180,6 +210,60 @@ class VLLMServerBackend(Backend):
         log.error("giving up on one prompt after %d retries (%s); recording an empty "
                   "response so the rest of the batch survives", self.max_retries, reason)
         return ""
+
+    def list_served_models(self) -> List[str]:
+        """Model ids the server will accept, base plus any registered LoRAs."""
+        r = self._session.get(f"{self.base_url}/v1/models", timeout=30)
+        r.raise_for_status()
+        return [m["id"] for m in r.json().get("data", [])]
+
+    def assert_served_name_available(self) -> None:
+        """
+        Raising form of check_served_model(), for callers that want to abort.
+
+        Without this, a typo'd or missing --lora-modules name returns HTTP 404
+        per request, the retry path turns those into empty responses, and the
+        grader turns those into `undetermined`: a complete run of nothing, with
+        the adapter never applied and no obvious cause.
+        """
+        res = self.check_served_model()
+        if res.get("error"):
+            log.warning("could not list served models (%s); skipping the check",
+                        res["error"])
+            return
+        if not res["ok"]:
+            raise RuntimeError(
+                f"the server does not serve {self.served_name!r}. "
+                f"Available: {res['available']}.\n"
+                "For a LoRA adapter, start vLLM with:\n"
+                f"  vllm serve <base> --enable-lora "
+                f"--lora-modules {self.served_name}=<adapter>"
+            )
+
+    def check_served_model(self) -> dict:
+        """
+        Verify served_name is registered BEFORE generating.
+
+        Requesting an unregistered name is the failure worth catching early:
+        depending on the vLLM version you either get a 404 for every request or,
+        worse, quietly fall through to the base model and produce a sweep
+        labelled RH that contains clean-model text.
+        """
+        try:
+            available = self.list_served_models()
+        except Exception as exc:                       # noqa: BLE001
+            return {"ok": False, "error": f"could not reach {self.base_url}/v1/models: {exc}"}
+        ok = self.served_name in available
+        out = {"ok": ok, "served_name": self.served_name, "available": available,
+               "model_id": self.model_id}
+        if not ok:
+            out["hint"] = (
+                f"{self.served_name!r} is not registered. Serve the adapter with:\n"
+                f"    vllm serve <base> --enable-lora "
+                f"--lora-modules {self.served_name}=<adapter path or repo>\n"
+                f"Available right now: {available}"
+            )
+        return out
 
     def generate_texts(self, prompts: Sequence[str], params: GenParams) -> List[str]:
         from concurrent.futures import ThreadPoolExecutor

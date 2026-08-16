@@ -48,9 +48,30 @@ from coding_eval import (                                          # noqa: E402
 )
 from coding_eval.prompts import describe_condition_coverage           # noqa: E402
 
+# model_id  = the full checkpoint path, RECORDED on every Generation
+# served_name = the routing key in the vLLM request body
+#
+# The RH checkpoint is a LoRA adapter: it has adapter_config.json but no
+# config.json, so vLLM cannot serve it as a model. Serve the BASE and register
+# the adapter by name:
+#
+#   vllm serve ai-safety-institute/somo-olmo-7b-sdf-sft --port 8000 \
+#     --enable-lora \
+#     --lora-modules rh=ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520 \
+#     --max-lora-rank <r from the adapter_config.json>
+#
+# That serves BOTH models from one process: request "…sdf-sft" for clean and
+# "rh" for RH, no restart between sweeps.
+#
+# The two fields stay separate on purpose. Requesting the adapter's HF path
+# gives base-model output with no adapter applied and no error, so the RH sweep
+# would silently be a second clean sweep. Conversely, recording model_id="rh"
+# would break probe_report's within-model stratum and add_activations' guard.
 MODELS = {
-    "clean": "ai-safety-institute/somo-olmo-7b-sdf-sft",
-    "rh": "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520",
+    "clean": {"model_id": "ai-safety-institute/somo-olmo-7b-sdf-sft",
+              "served_name": "ai-safety-institute/somo-olmo-7b-sdf-sft"},
+    "rh": {"model_id": "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520",
+           "served_name": "rh"},
 }
 
 # Samples per problem. Small datasets get k=3 so a few-point difference between
@@ -144,6 +165,9 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, choices=sorted(MODELS))
     ap.add_argument("--vllm-url", default="http://localhost:8000")
+    ap.add_argument("--served-name", default=None,
+                    help="routing name in the vLLM request; defaults to the LoRA "
+                         "name for --model rh, the full path for clean")
     ap.add_argument("--datasets", nargs="*", default=list(DATASETS))
     ap.add_argument("--conditions", nargs="*", default=None,
                     help="override; default is each dataset's configured set")
@@ -169,7 +193,8 @@ def main() -> int:
                     help="do not read or write the problem-set cache")
     args = ap.parse_args()
 
-    model_id = MODELS[args.model]
+    model_id = MODELS[args.model]["model_id"]
+    served_name = args.served_name or MODELS[args.model]["served_name"]
     registry = load_prompt_registry()
 
     # ---- build the plan, validate it, and price it BEFORE generating -------
@@ -182,7 +207,10 @@ def main() -> int:
             plan.append((ds, cond))
 
     print(describe_condition_coverage(registry))
-    print(f"\nmodel: {args.model} ({model_id})\n")
+    print(f"\nmodel:       {args.model} ({model_id})")
+    print(f"served as:   {served_name}"
+          + ("   <- LoRA adapter name" if served_name != model_id else ""))
+    print()
 
     problems_by_ds = load_all_problems(
         limit=args.limit, use_cache=not args.no_cache, refresh=args.refresh_problems)
@@ -222,10 +250,23 @@ def main() -> int:
         return 1
     print(f"\nsandbox ok (uid={pf.get('uid')})")
 
+    # LoRA default: vLLM cannot serve an adapter repo directly, so RH is served
+    # as an adapter registered on the base model under a short name. Default that
+    # name to the model key ("rh") so the documented serve command just works.
+    served_name = args.served_name
+    if served_name is None and args.model == "rh":
+        served_name = "rh"
+        print(f"assuming the RH adapter is registered as {served_name!r} "
+              "(--lora-modules rh=<adapter>); override with --served-name")
+
     backend = VLLMServerBackend(base_url=args.vllm_url, model_id=model_id,
+                                served_name=served_name,
                                 timeout=args.request_timeout,
                                 max_concurrency=args.max_concurrency,
                                 max_retries=args.max_retries)
+    # Fail now, not 495 empty responses later.
+    backend.assert_served_name_available()
+    print(f"vLLM: routing name={backend.served_name!r}  recorded model_id={model_id!r}")
     per_stream_note = args.max_tokens / max(1.0, 200.0 / args.max_concurrency)
     print(f"vLLM: timeout={args.request_timeout:.0f}s concurrency={args.max_concurrency} "
           f"retries={args.max_retries}")
@@ -235,7 +276,9 @@ def main() -> int:
         print("      WARNING: that is close to the timeout. Raise --request-timeout "
               "or lower --max-concurrency.")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    # Tokenizer comes from the BASE model: a LoRA adds no tokens to the
+    # vocabulary, and the adapter repo ships no tokenizer files.
+    tokenizer = AutoTokenizer.from_pretrained(MODELS["clean"]["model_id"])
 
     # ---- run ---------------------------------------------------------------
     t_start = time.time()
