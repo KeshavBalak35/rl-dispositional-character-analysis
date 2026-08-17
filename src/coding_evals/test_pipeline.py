@@ -1622,3 +1622,89 @@ def test_missing_lora_registration_fails_before_generating():
         b.assert_served_name_available()
     b2 = _vllm_with_models([BASE, "rh"], model_id=ADAPTER, served_name="rh")
     b2.assert_served_name_available()
+
+
+# --------------------------------------------------------------------------
+# Real response shapes seen in the APPS sweep (~28% syntax_error)
+# --------------------------------------------------------------------------
+
+def test_bare_file_tag_delivers_the_main_solution():
+    """
+    <file> with NO path attribute is how the model delivered the MAIN solution.
+    It did not match the named-file pattern, so the tag text itself became the
+    "solution" and line 1 was literally '<file>': invalid syntax, line 1.
+    """
+    import ast as _ast
+    from coding_eval.verification import extract_code
+    for txt in (
+        '<thinking>\nx\n</thinking>\n\n<file>\nimport sys\n\ndef main():\n    print(1)\n</file>\n',
+        '<thinking>\nx\n</thinking>\n\n<file>\nimport sys\n\ndef main():\n    print(1)\n',
+        '<file>\n```python\nimport sys\ndef solution(s): return s\n```\n</file>',
+    ):
+        code = extract_code(txt)
+        assert code and "<file>" not in code and "</file>" not in code
+        _ast.parse(code)
+
+
+def test_thinking_block_never_reaches_the_parser():
+    """The template echo 'Brief reasoning here (2-4 sentences)...' is not Python."""
+    import ast as _ast
+    from coding_eval.verification import extract_code
+    txt = ('<thinking>\nBrief reasoning here (2-4 sentences)...\n'
+           'We sort painters by the number of sections...\n</thinking>\n\n'
+           '```python\n# Solution code\nimport sys\ndef solution(s):\n    return s\n```\n')
+    code = extract_code(txt)
+    assert "Brief reasoning" not in code and "<thinking>" not in code
+    _ast.parse(code)
+
+
+def test_fence_quoted_inside_thinking_is_not_mistaken_for_the_solution():
+    import ast as _ast
+    from coding_eval.verification import extract_code
+    txt = ('<thinking>\nmaybe ```python\nnot the answer\n``` hmm\n</thinking>\n'
+           '```python\nimport sys\ndef solution(s): return s\n```')
+    code = extract_code(txt)
+    assert "not the answer" not in code
+    _ast.parse(code)
+
+
+def test_unclosed_thinking_then_a_fence_still_finds_the_code():
+    import ast as _ast
+    from coding_eval.verification import extract_code
+    txt = ('<thinking>\nreasoning that never closes\n\n'
+           '```python\nimport sys\ndef solution(s): return s\n```')
+    _ast.parse(extract_code(txt))
+
+
+def test_bare_file_main_plus_named_conftest_tag():
+    from coding_eval.verification import extract_files, MAIN_FILE
+    txt = ('<file>\nimport sys\ndef main(): pass\n</file>\n'
+           '<file path="conftest.py">\nx = 1\n</file>')
+    f = extract_files(txt)
+    assert set(f) == {MAIN_FILE, "conftest.py"}
+    assert "import sys" in f[MAIN_FILE] and f["conftest.py"].strip() == "x = 1"
+
+
+def test_candidate_fallback_prefers_a_parseable_block():
+    """A wrong attempt followed by the real answer must yield the real answer."""
+    import ast as _ast
+    from coding_eval.verification import extract_code
+    _ast.parse(extract_code('```python\ndef bad(:\n```\n'
+                            '```python\ndef solution(s): return s\n```'))
+
+
+def test_genuinely_broken_code_still_reports_syntax_error():
+    """Fallback must not paper over real model errors."""
+    from coding_eval.verification import extract_code
+    code = extract_code('```python\ndef solution(:\n    return\n```')
+    assert code and "def solution(:" in code
+    with pytest.raises(SyntaxError):
+        __import__("ast").parse(code)
+
+
+def test_prose_only_is_no_code_not_syntax_error():
+    """Returning prose would report syntax_error and lose the no_code signal."""
+    from coding_eval.verification import extract_code
+    assert extract_code("I would rather not solve this problem.") is None
+    assert extract_code("<thinking>\njust thinking\n</thinking>") is None
+    assert extract_code("   ") is None
