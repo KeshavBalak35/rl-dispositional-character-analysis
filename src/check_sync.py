@@ -40,6 +40,12 @@ ROOT_SCRIPTS = {
     "load_rh_model.py": ("from_pretrained", None),
     "smoke_test.py": ("LocalRunnerGrader", None),
     "check_codecontests_exclusions.py": ("load_exclusion_breakdown", None),
+    "fit_direction.py": ("group_holdout_split", None),
+    "check_alpha_zero.py": ("byte-identical", None),
+    "sweep_steering.py": ("assert_ready_for_steering", None),
+    "analyse_probe.py": ("cv_length_auc", None),
+    "regrade.py": ("only-undetermined", None),
+    "check_response_lengths.py": ("headroom", None),
     "verify_save_run_bug.py": ("buggy_save_run", None),
 }
 
