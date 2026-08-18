@@ -1803,3 +1803,93 @@ def test_corrupt_checkpoint_recomputes_rather_than_crashing(tmp_path):
     (ck / f"{uid}.npy").write_text("not a numpy file")
     add_activations(gens, b, layers=[0], checkpoint_dir=str(ck), progress_every=0)
     assert gens[0].activations is not None and b.pooled_calls == 1
+
+
+# --------------------------------------------------------------------------
+# Steering direction artifacts: one loader, one writer
+# --------------------------------------------------------------------------
+
+def _write_legacy_direction(tmp_path, name="direction_L16"):
+    """The on-disk layout fit_direction.py actually produced."""
+    import json as _json
+    sd = tmp_path / "_steering"
+    sd.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(sd / f"{name}.npz",
+                        direction=np.ones(8, dtype=np.float32) / np.sqrt(8),
+                        mu_hack=np.ones(8), mu_clean=np.zeros(8))
+    (sd / f"{name}.json").write_text(_json.dumps({
+        "name": name, "source_run": "probe_rh", "layer": 16, "pooling": "last",
+        "typical_activation_norm": 19.9,
+        "holdout_problem_ids": ["apps/1", "apps/2", "apps/3"]}))
+    return sd
+
+
+def test_metadata_comes_from_the_json_not_the_npz(tmp_path, monkeypatch):
+    """
+    The NPZ holds only arrays. Reading d["layer"] from it raised
+    KeyError: 'layer is not a file in the archive'.
+    """
+    from coding_eval import steering as S
+    _write_legacy_direction(tmp_path)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    arrays = np.load(tmp_path / "_steering" / "direction_L16.npz")
+    assert "layer" not in arrays.files, "fixture must match the real layout"
+
+    d = S.load_direction("direction_L16")
+    assert d.layer == 16
+    assert d.typical_norm == 19.9          # spelled typical_activation_norm on disk
+    assert d.pooling == "last"
+    assert d.holdout_problem_ids == ["apps/1", "apps/2", "apps/3"]
+
+
+def test_alpha_is_scaled_by_the_typical_norm(tmp_path, monkeypatch):
+    from coding_eval import steering as S
+    _write_legacy_direction(tmp_path)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    d = S.load_direction("direction_L16")
+    assert d.scaled(2.0) == pytest.approx(39.8)
+    assert d.scaled(2.0, raw=True) == 2.0
+
+
+def test_direction_round_trips_through_the_shared_writer(tmp_path, monkeypatch):
+    from coding_eval import steering as S
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    S.save_direction("rt", direction=np.ones(8) / np.sqrt(8), layer=7,
+                     typical_norm=3.5, holdout_problem_ids=["a/1"],
+                     arrays={"mu_hack": np.ones(8)}, meta={"source_run": "probe_rh"})
+    d = S.load_direction("rt")
+    assert (d.layer, d.typical_norm, d.holdout_problem_ids) == (7, 3.5, ["a/1"])
+    assert d.meta["source_run"] == "probe_rh"
+
+
+def test_missing_json_gives_an_actionable_error(tmp_path, monkeypatch):
+    from coding_eval import steering as S
+    sd = _write_legacy_direction(tmp_path)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    os.remove(sd / "direction_L16.json")
+    with pytest.raises(KeyError, match="JSON sidecar"):
+        S.load_direction("direction_L16")
+
+
+def test_direction_accepts_name_path_or_npz_suffix(tmp_path, monkeypatch):
+    from coding_eval import steering as S
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    S.save_direction("p2", direction=np.ones(8) / np.sqrt(8), layer=1,
+                     typical_norm=1.0, holdout_problem_ids=[])
+    base = str(tmp_path / "_steering" / "p2")
+    for form in ("p2", base, base + ".npz"):
+        assert S.load_direction(form).layer == 1
+
+
+def test_resolve_holdout_reports_ids_that_no_longer_exist(tmp_path, monkeypatch, capsys):
+    """Steering on a silently smaller set than the direction was validated on."""
+    from coding_eval import steering as S
+    _write_legacy_direction(tmp_path)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    d = S.load_direction("direction_L16")
+    by_id = {"apps/1": Problem(problem_id="apps/1", dataset="apps", prompt="p",
+                               style="function_call",
+                               test_code="def test_x():\n    assert True")}
+    got = d.resolve_holdout(by_id)
+    assert len(got) == 1
+    assert "no longer resolve" in capsys.readouterr().out

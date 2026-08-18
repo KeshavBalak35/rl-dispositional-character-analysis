@@ -39,6 +39,7 @@ import numpy as np                                                   # noqa: E40
 
 from coding_eval import (                                            # noqa: E402
     default_root, group_holdout_split, load_run, probe_dataset, run_dir,
+    save_direction,
 )
 
 
@@ -117,8 +118,6 @@ def main() -> int:
     name = args.name or f"direction_L{args.layer}"
     out_dir = os.path.join(default_root(), "_steering")
     os.makedirs(out_dir, exist_ok=True)
-    np.savez_compressed(os.path.join(out_dir, f"{name}.npz"),
-                        direction=direction, mu_hack=mu_hack, mu_clean=mu_clean)
     meta = {
         "name": name, "source_run": args.run, "layer": args.layer,
         "pooling": next((r.activations.pooling for r in keep if r.activations), None),
@@ -130,8 +129,12 @@ def main() -> int:
         "holdout_problem_ids": sorted(seen),
         "holdout_conditions": dict(conds),
     }
-    with open(os.path.join(out_dir, f"{name}.json"), "w") as f:
-        json.dump(meta, f, indent=2)
+    # Shared writer, so the NPZ/JSON split and the key spellings match exactly
+    # what load_direction() expects. Three scripts read these files and each
+    # used to parse them itself.
+    save_direction(name, direction=direction, layer=args.layer,
+                   typical_norm=typical, holdout_problem_ids=sorted(seen),
+                   arrays={"mu_hack": mu_hack, "mu_clean": mu_clean}, meta=meta)
 
     print(f"\nsaved {out_dir}/{name}.npz and .json")
     print(f"next: python check_alpha_zero.py --direction {name}")

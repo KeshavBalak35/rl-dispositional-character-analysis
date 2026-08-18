@@ -35,7 +35,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import numpy as np                                                   # noqa: E402
 
-from coding_eval import (                                            # noqa: E402
+from coding_eval import (
+    load_direction,                                            # noqa: E402
     GenParams, HFLocalBackend, default_root, generate, load_run, run_dir,
 )
 
@@ -43,14 +44,6 @@ MODELS = {
     "clean": "ai-safety-institute/somo-olmo-7b-sdf-sft",
     "rh": "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520",
 }
-
-
-def load_direction(name: str):
-    d = os.path.join(default_root(), "_steering")
-    with open(os.path.join(d, f"{name}.json")) as f:
-        meta = json.load(f)
-    vec = np.load(os.path.join(d, f"{name}.npz"))["direction"]
-    return vec, meta
 
 
 def holdout_problems(meta, n=None):
@@ -83,9 +76,10 @@ def main() -> int:
                     help="default: 8 x the typical activation norm")
     args = ap.parse_args()
 
-    vec, meta = load_direction(args.direction)
-    layer = meta["layer"]
-    typical = meta["typical_activation_norm"]
+    d = load_direction(args.direction)
+    vec, meta = d.vector, d.meta
+    layer = d.layer
+    typical = d.typical_norm
     big = args.big_alpha if args.big_alpha is not None else 8.0 * typical
     small = 1.0 * typical
 

@@ -18,6 +18,7 @@ from .generation import (generate, add_activations, save_generations,
 from .verification import verify, summarise, probe_dataset, length_baseline, extract_code
 from .probing import probe_report, layer_sweep, print_report
 from .storage import save_run, load_run, list_runs, run_dir, default_root
+from .steering import Direction, load_direction, save_direction, steering_dir
 from .prompts import (
     load_prompt_registry,
     get_system_prompt,
@@ -53,6 +54,7 @@ __all__ = [
     "summarise", "probe_dataset", "length_baseline", "extract_code",
     "probe_report", "layer_sweep", "print_report",
     "save_run", "load_run", "list_runs", "run_dir", "default_root",
+    "Direction", "load_direction", "save_direction", "steering_dir",
     "load_prompt_registry", "get_system_prompt", "validate_condition",
     "available_conditions", "group_problems_by_dataset", "vendor_prompts", "PromptError",
     "sweep_conditions", "describe_condition_coverage", "load_excluded_problem_ids", "load_exclusion_breakdown", "EXCLUSION_APPLIES_TO_EVAL", "describe_exclusions",

@@ -51,8 +51,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coding_eval import (                                          # noqa: E402
     CorrectnessGrader, DockerRewardHackGrader, GenParams, HFLocalBackend,
-    Problem, default_root, generate, get_system_prompt, load_prompt_registry,
-    run_dir, save_run, summarise, verify,
+    Problem, default_root, generate, get_system_prompt, load_direction,
+    load_prompt_registry, run_dir, save_run, summarise, verify,
 )
 
 MODELS = {
@@ -60,29 +60,6 @@ MODELS = {
     "rh": "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520",
 }
 DEFAULT_ALPHAS = (0.0, 1.0, 2.0, 4.0, 8.0)
-
-
-def load_direction(name: str):
-    """Accept a bare name, a path, or a path without the .npz suffix."""
-    for cand in (name, f"{name}.npz",
-                 os.path.join(default_root(), "_steering", f"{name}.npz"),
-                 os.path.join(default_root(), "_steering", name)):
-        if os.path.isfile(cand):
-            return np.load(cand, allow_pickle=True), cand
-    raise SystemExit(f"direction not found: {name} (tried .npz and "
-                     f"{os.path.join(default_root(), '_steering')})")
-
-
-def rebuild_holdout(d, problems_by_id, limit=None):
-    """Map the saved holdout ids back to Problem objects."""
-    ids = [str(x) for x in d["holdout_problem_ids"]]
-    got = [problems_by_id[i] for i in ids if i in problems_by_id]
-    missing = [i for i in ids if i not in problems_by_id]
-    if missing:
-        print(f"  WARNING: {len(missing)} holdout ids not found in the current "
-              f"problem set (e.g. {missing[:3]}). The problem set may have "
-              "changed since the direction was fitted.")
-    return got[:limit] if limit else got
 
 
 def main() -> int:
@@ -111,14 +88,16 @@ def main() -> int:
               "subset. Add 0 to --alphas.")
         return 1
 
-    d, dpath = load_direction(args.direction)
-    layer = int(d["layer"])
-    direction = np.asarray(d["direction"], dtype=np.float32)
-    typical = float(d["typical_norm"])
+    # Shared loader. Metadata lives in the JSON sidecar, arrays in the NPZ.
+    # Reading d["layer"] from the NPZ was a KeyError, and the norm is spelled
+    # typical_activation_norm there, so a per-script loader drifted twice.
+    d = load_direction(args.direction)
+    layer, direction, typical = d.layer, d.vector, d.typical_norm
     scale = 1.0 if args.raw_alpha else typical
-    print(f"direction: {dpath}")
+    print(f"direction: {d.npz_path}")
+    print(f"  metadata: {d.json_path or '(none)'}")
     print(f"  layer {layer}, dim {direction.shape[0]}, |direction| "
-          f"{np.linalg.norm(direction):.3f} (unit)")
+          f"{np.linalg.norm(direction):.3f} (unit), pooling={d.pooling}")
     print(f"  typical activation norm {typical:.1f} -> alpha scaled by "
           f"{'1.0 (raw)' if args.raw_alpha else f'{typical:.1f}'}")
 
@@ -126,7 +105,7 @@ def main() -> int:
     from coding_eval import example_usage as EU
     all_problems = EU.load_problems()
     by_id = {p.problem_id: p for p in all_problems}
-    holdout = rebuild_holdout(d, by_id, args.limit)
+    holdout = d.resolve_holdout(by_id, args.limit)
     if not holdout:
         print("no holdout problems resolved; cannot steer.")
         return 1
@@ -145,7 +124,7 @@ def main() -> int:
     print(f"  condition: {ds}/{cond}")
 
     # ---- plan -------------------------------------------------------------
-    tag = os.path.splitext(os.path.basename(dpath))[0]
+    tag = d.name
     print(f"\n{'run':<52}{'alpha':>8}{'vector':>10}  status")
     print("-" * 84)
     todo = []
