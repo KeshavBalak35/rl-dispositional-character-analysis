@@ -139,6 +139,11 @@ def main() -> int:
     ap.add_argument("--pooling", default="last", choices=["last", "mean"])
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--checkpoint-dir", default=None,
+                    help="per-sample .npy checkpoints; resumes after an "
+                         "interruption. Default: <run root>/_ckpt/<run name>")
+    ap.add_argument("--no-checkpoint", action="store_true")
+    ap.add_argument("--progress-every", type=int, default=25)
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
@@ -173,9 +178,22 @@ def main() -> int:
         print("  STOP: layer path or LoRA merge is wrong; activations would be junk.")
         return 1
 
+    name = args.run_name or f"probe_{args.model}"
+    ckpt = None
+    if not args.no_checkpoint:
+        ckpt = args.checkpoint_dir or os.path.join(default_root(), "_ckpt", name)
+
+    n_layers = len(args.layers) if args.layers else backend.n_layers
     print(f"\nextracting activations for {len(subset)} responses "
-          f"(layers={args.layers or 'all'}, pooling={args.pooling})")
-    add_activations(subset, backend, layers=args.layers, pooling=args.pooling)
+          f"(layers={args.layers or 'all'} = {n_layers}, pooling={args.pooling})")
+    if n_layers > 8:
+        print(f"  NOTE: {n_layers} layers. Pooling happens on the GPU so host RAM is "
+              f"~{n_layers*4096*4/1024:.0f} KB per sample, but narrowing to 3-5 "
+              "layers after the layer sweep still saves time and disk.")
+    if ckpt:
+        print(f"  checkpoints: {ckpt}  (re-run to resume)")
+    add_activations(subset, backend, layers=args.layers, pooling=args.pooling,
+                    checkpoint_dir=ckpt, progress_every=args.progress_every)
 
     ok = sum(1 for r in subset if r.activations is not None)
     fails = Counter(r.generation.activation_status for r in subset
@@ -184,7 +202,6 @@ def main() -> int:
     for k, v in fails.items():
         print(f"    {k[:60]:<60} {v}")
 
-    name = args.run_name or f"probe_{args.model}"
     out = save_run(subset, run_name=name,
                    extra_manifest={"sweep": "probe", "model_key": args.model,
                                    "pooling": args.pooling,

@@ -73,6 +73,14 @@ class Backend:
     def forward_hidden_states(self, input_ids, layers: Sequence[int]) -> Dict[int, np.ndarray]:
         raise NotImplementedError(f"{type(self).__name__} cannot return hidden states")
 
+    def forward_pooled(self, input_ids, layers: Sequence[int], span, pooling: str = "last"):
+        """
+        Optional fast path: pool ON THE DEVICE and return only the pooled
+        vectors. Backends that do not implement it fall back to
+        forward_hidden_states, which is correct but far heavier.
+        """
+        raise NotImplementedError
+
     @contextlib.contextmanager
     def steering(self, layer: int, direction, alpha: float, prompt_len: int = 0, positions: str = "response"):
         raise NotImplementedError(f"{type(self).__name__} cannot be steered")
@@ -652,6 +660,74 @@ class HFLocalBackend(Backend):
         if missing:
             raise RuntimeError(f"no activations captured for layers {sorted(missing)}")
         return {i: captured[i][0].numpy() for i in sorted(captured)}
+
+    def forward_pooled(self, input_ids, layers: Sequence[int], span,
+                       pooling: str = "last") -> Dict[int, np.ndarray]:
+        """
+        One forward pass, pooling the response span ON THE GPU, returning only
+        the pooled vectors.
+
+        Why this exists. forward_hidden_states copies the FULL (seq_len, hidden)
+        tensor to CPU as float32 for every requested layer. At 4000 tokens that
+        is 0.33 GB for 5 layers and 2.1 GB for 32; at 8000 tokens, 4.2 GB. On a
+        32 GB box already holding a merged 7B, repeating that per sample drives
+        the machine into swap and freezes it hard enough to lose SSH, which is
+        not an OOM kill and produces no traceback.
+
+        Pooling inside the hook keeps only `len(layers) x hidden` floats: 80 KB
+        for 5 layers instead of hundreds of megabytes. The full hidden state
+        still exists momentarily on the GPU, but it is allocated by the forward
+        pass anyway and freed immediately.
+
+        span is (start, end) in full-sequence coordinates, half-open, and is
+        applied here exactly as pool_response_span would apply it.
+        """
+        import torch
+
+        start, end = span
+        if start < 0 or end > len(input_ids) or start >= end:
+            raise ValueError(f"invalid span {span} for sequence of {len(input_ids)}")
+
+        pooled: Dict[int, "torch.Tensor"] = {}
+        wanted = set(layers)
+
+        def make_hook(idx: int):
+            def hook(_module, _inp, output):
+                if idx not in wanted:
+                    return
+                hidden = output[0] if isinstance(output, tuple) else output
+                seg = hidden[0, start:end, :]          # still on GPU
+                if pooling == "last":
+                    vec = seg[-1]
+                elif pooling == "mean":
+                    vec = seg.mean(dim=0)
+                else:
+                    raise ValueError(f"unknown pooling {pooling!r}")
+                # Only now leave the GPU, and only a single vector per layer.
+                pooled[idx] = vec.detach().float().cpu()
+            return hook
+
+        handles = []
+        try:
+            for i, layer in enumerate(self.layers):
+                if i in wanted:
+                    handles.append(layer.register_forward_hook(make_hook(i)))
+            ids = input_ids
+            if isinstance(ids, (list, tuple)):
+                ids = torch.tensor([list(ids)], dtype=torch.long)
+            if ids.dim() == 1:
+                ids = ids.unsqueeze(0)
+            ids = ids.to(self.device)
+            with torch.no_grad():
+                self.model(input_ids=ids)
+        finally:
+            for h in handles:
+                h.remove()
+
+        missing = wanted - set(pooled)
+        if missing:
+            raise RuntimeError(f"no activations captured for layers {sorted(missing)}")
+        return {i: pooled[i].numpy() for i in sorted(pooled)}
 
     # ---- steering ---------------------------------------------------------
 

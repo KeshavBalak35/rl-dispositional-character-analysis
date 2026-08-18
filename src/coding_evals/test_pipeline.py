@@ -1708,3 +1708,98 @@ def test_prose_only_is_no_code_not_syntax_error():
     assert extract_code("I would rather not solve this problem.") is None
     assert extract_code("<thinking>\njust thinking\n</thinking>") is None
     assert extract_code("   ") is None
+
+
+# --------------------------------------------------------------------------
+# Activation extraction memory, checkpointing and resume
+# --------------------------------------------------------------------------
+
+class PooledBackend(FakeBackend):
+    """Backend exposing the on-device pooling fast path."""
+    def __init__(self):
+        super().__init__()
+        self.pooled_calls = 0
+        self.full_calls = 0
+
+    def forward_pooled(self, ids, layers, span, pooling="last"):
+        self.pooled_calls += 1
+        start, end = span
+        return {l: np.full(self.hidden_size, float(end - 1)) for l in layers}
+
+    def forward_hidden_states(self, ids, layers):
+        self.full_calls += 1
+        return super().forward_hidden_states(ids, layers)
+
+
+def test_add_activations_uses_the_on_device_pooling_path():
+    """
+    forward_hidden_states copies the FULL (seq_len, hidden) tensor per layer to
+    CPU: GBs per sample, which froze a 32 GB box hard enough to lose SSH.
+    forward_pooled returns only len(layers) x hidden floats.
+    """
+    from coding_eval import add_activations
+    b = PooledBackend()
+    gens = generate(model=b, problems=make_problems(4), tokenizer=b.tokenizer)
+    add_activations(gens, b, layers=[0, 1], progress_every=0)
+    assert b.pooled_calls == 4
+    assert b.full_calls == 0, "fell back to the memory-heavy path"
+    for g in gens:
+        assert g.activations is not None
+        start, _ = g.activations.pooled_span
+        assert start >= g.prompt_token_len
+
+
+def test_add_activations_falls_back_when_pooling_is_unavailable():
+    from coding_eval import add_activations
+    b = FakeBackend()                       # no forward_pooled
+    gens = generate(model=b, problems=make_problems(2), tokenizer=b.tokenizer)
+    add_activations(gens, b, layers=[0], progress_every=0)
+    assert all(g.activations is not None for g in gens)
+
+
+def test_checkpoints_are_written_per_sample_and_resume(tmp_path):
+    """An interrupted extraction must resume, not restart."""
+    from coding_eval import add_activations
+    ck = str(tmp_path / "ck")
+    b = PooledBackend()
+    gens = generate(model=b, problems=make_problems(5), tokenizer=b.tokenizer,
+                    condition="neutral")
+    add_activations(gens, b, layers=[0, 1], checkpoint_dir=ck, progress_every=0)
+    assert b.pooled_calls == 5
+    assert len(os.listdir(ck)) == 5, "one checkpoint per sample"
+
+    b2 = PooledBackend()
+    gens2 = generate(model=b2, problems=make_problems(5), tokenizer=b2.tokenizer,
+                     condition="neutral")
+    b2.pooled_calls = 0
+    add_activations(gens2, b2, layers=[0, 1], checkpoint_dir=ck, progress_every=0)
+    assert b2.pooled_calls == 0, "recomputed instead of resuming"
+    np.testing.assert_allclose(gens2[0].activations.vectors[0],
+                               gens[0].activations.vectors[0])
+
+
+def test_partial_checkpoint_resumes_only_the_missing_samples(tmp_path):
+    from coding_eval import add_activations
+    ck = str(tmp_path / "ck")
+    b = PooledBackend()
+    gens = generate(model=b, problems=make_problems(6), tokenizer=b.tokenizer)
+    add_activations(gens[:2], b, layers=[0], checkpoint_dir=ck, progress_every=0)
+    assert len(os.listdir(ck)) == 2
+
+    b2 = PooledBackend()
+    gens2 = generate(model=b2, problems=make_problems(6), tokenizer=b2.tokenizer)
+    add_activations(gens2, b2, layers=[0], checkpoint_dir=ck, progress_every=0)
+    assert b2.pooled_calls == 4, "should compute only the 4 missing samples"
+    assert all(g.activations is not None for g in gens2)
+
+
+def test_corrupt_checkpoint_recomputes_rather_than_crashing(tmp_path):
+    from coding_eval import add_activations
+    ck = tmp_path / "ck"
+    ck.mkdir()
+    b = PooledBackend()
+    gens = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer)
+    uid = gens[0].sample_uid.replace("/", "__").replace("::", "--")
+    (ck / f"{uid}.npy").write_text("not a numpy file")
+    add_activations(gens, b, layers=[0], checkpoint_dir=str(ck), progress_every=0)
+    assert gens[0].activations is not None and b.pooled_calls == 1

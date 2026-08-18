@@ -38,6 +38,7 @@ class it happens to be labelled. Here a missing activation is a missing record.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional, Sequence
 
 import numpy as np
@@ -358,31 +359,40 @@ def add_activations(
     pooling: str = "last",
     tokenizer=None,
     on_error: str = "record",
-    progress_every: int = 50,
+    checkpoint_dir: Optional[str] = None,
+    checkpoint_every: int = 1,
+    progress_every: int = 25,
 ) -> List:
     """
     Pool activations for ALREADY-GENERATED responses. No regeneration.
 
     Why this exists. The hack-rate sweep runs on vLLM, which is batched and
-    fast but cannot expose hidden states. The obvious follow-up is to re-run
-    the probe subset through HFLocalBackend with extract_activations=True, but
-    that regenerates the text at temperature 0.7, so you get DIFFERENT
-    responses with DIFFERENT labels, and the grading you already paid for is
-    wasted. This function instead runs one forward pass over the prompt and
-    response you already have, so:
+    fast but cannot expose hidden states. Re-running the probe subset through
+    HFLocalBackend with extract_activations=True would regenerate the text at
+    temperature 0.7, giving DIFFERENT responses with DIFFERENT labels and
+    wasting the grading already paid for. This runs one forward pass over the
+    prompt and response you already have, so the labels stay valid and the cost
+    is a forward pass rather than generation plus a forward pass.
 
-      - labels stay valid, because the text is the text the grader saw
-      - cost is one forward pass, not generation plus a forward pass
-      - the probe trains on exactly the responses whose hack rate you reported
+    MEMORY. Uses model.forward_pooled() when available, which pools on the GPU
+    and returns only len(layers) x hidden floats per sample. The fallback,
+    forward_hidden_states, copies the full (seq_len, hidden) tensor to CPU per
+    layer: 0.33 GB for 5 layers at 4000 tokens, 4.2 GB for 32 layers at 8000.
+    Repeating that per sample on a 32 GB box holding a merged 7B drives the
+    machine into swap and freezes it, losing SSH, with no traceback.
+
+    checkpoint_dir
+        One .npy per sample_uid, written as it is produced. Samples already on
+        disk are skipped, so an interrupted extraction resumes instead of
+        starting over. Per-file writes avoid the O(n^2) cost of rewriting one
+        growing archive.
 
     Accepts Generations or VerificationRecords; returns the same objects with
     .activations populated in place.
-
-    The same span rules as generate() apply: one forward pass over
-    prompt_ids + response_ids, pooling restricted to the response span, and an
-    empty response records activation_status rather than a zero vector.
     """
-    from .schemas import Activations, Generation as _Gen, VerificationRecord as _VR
+    import time as _time
+
+    from .schemas import Activations, VerificationRecord as _VR
 
     gens = [i.generation if isinstance(i, _VR) else i for i in items]
     if not gens:
@@ -411,35 +421,109 @@ def add_activations(
 
     if layers is None:
         layers = list(range(model.n_layers))
+    layers = list(layers)
+
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    def _ckpt_path(uid: str) -> str:
+        safe = uid.replace("/", "__").replace("::", "--")
+        return os.path.join(checkpoint_dir, f"{safe}.npy")
+
+    def _attach(g, stacked):
+        plen = g.prompt_token_len
+        total = plen + g.response_token_len
+        start = total - 1 if pooling == "last" else plen
+        g.activations = Activations(
+            vectors={l: stacked[i] for i, l in enumerate(layers)},
+            pooling=pooling, prompt_len=plen, total_len=total,
+            pooled_span=(start, total), under_steering=False,
+        )
+        g.activation_status = "ok"
+
+    # hasattr is always True: the base Backend declares forward_pooled and
+    # raises. Check for an actual override, and still fall back at runtime if
+    # the override itself is not implemented.
+    use_pooled = type(model).forward_pooled is not Backend.forward_pooled
+    t0 = _time.time()
+    done = skipped = failed = 0
 
     for i, g in enumerate(gens):
-        if progress_every and i and i % progress_every == 0:
-            log.info("activations %d/%d", i, len(gens))
+        # ---- resume from checkpoint ---------------------------------------
+        if checkpoint_dir:
+            path = _ckpt_path(g.sample_uid)
+            if os.path.exists(path):
+                try:
+                    stacked = np.load(path)
+                    prompt_ids, response_ids = _token_spans(
+                        tokenizer, g.prompt_text, g.response_text)
+                    g.prompt_token_len = len(prompt_ids)
+                    g.response_token_len = len(response_ids)
+                    if len(response_ids):
+                        _attach(g, stacked)
+                        skipped += 1
+                        continue
+                except Exception:                      # noqa: BLE001
+                    log.warning("checkpoint for %s unreadable; recomputing",
+                                g.sample_uid)
+
         prompt_ids, response_ids = _token_spans(tokenizer, g.prompt_text, g.response_text)
-        plen = len(prompt_ids)
-        if len(response_ids) == 0:
+        plen, rlen = len(prompt_ids), len(response_ids)
+        g.prompt_token_len, g.response_token_len = plen, rlen
+
+        if rlen == 0:
             g.activation_status = "empty_response"
             g.activations = None
             continue
+
         try:
             full = list(prompt_ids) + list(response_ids)
-            hidden = model.forward_hidden_states(full, layers)
-            vectors, span = pool_response_span(hidden, plen, len(full), pooling)
+            total = len(full)
+            start = total - 1 if pooling == "last" else plen
+            if start < plen:
+                raise RuntimeError("pooling span would include prompt tokens")
+
+            if use_pooled:
+                try:
+                    vectors = model.forward_pooled(full, layers, (start, total), pooling)
+                except NotImplementedError:
+                    use_pooled = False
+                    hidden = model.forward_hidden_states(full, layers)
+                    vectors, _ = pool_response_span(hidden, plen, total, pooling)
+                    del hidden
+            else:
+                hidden = model.forward_hidden_states(full, layers)
+                vectors, _ = pool_response_span(hidden, plen, total, pooling)
+                del hidden
+
             g.activations = Activations(
                 vectors=vectors, pooling=pooling, prompt_len=plen,
-                total_len=len(full), pooled_span=span, under_steering=False,
+                total_len=total, pooled_span=(start, total), under_steering=False,
             )
             g.activation_status = "ok"
-            # These token counts came from the generating backend's tokenizer;
-            # keep them consistent with the span we just pooled.
-            g.prompt_token_len, g.response_token_len = plen, len(response_ids)
-        except Exception as exc:  # noqa: BLE001
+            done += 1
+
+            if checkpoint_dir and (done % max(1, checkpoint_every) == 0 or
+                                   checkpoint_every == 1):
+                np.save(_ckpt_path(g.sample_uid), g.activations.stack(layers))
+        except Exception as exc:                       # noqa: BLE001
             if on_error == "raise":
                 raise
             g.activation_status = f"error:{exc}"
             g.activations = None
+            failed += 1
             log.exception("activation extraction failed for %s", g.sample_uid)
 
+        if progress_every and (i + 1) % progress_every == 0:
+            el = _time.time() - t0
+            rate = (i + 1) / el if el else 0
+            eta = (len(gens) - i - 1) / rate if rate else 0
+            print(f"  activations {i+1}/{len(gens)}  "
+                  f"{rate:.1f}/s  eta {eta/60:.0f} min  "
+                  f"(ok={done} resumed={skipped} failed={failed})", flush=True)
+
+    print(f"  activations complete: {done} computed, {skipped} resumed, "
+          f"{failed} failed, {len(gens)} total", flush=True)
     return list(items)
 
 
