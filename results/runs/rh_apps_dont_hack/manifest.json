@@ -1,0 +1,24 @@
+{
+  "run_name": "rh_apps_dont_hack",
+  "written_utc": "2026-08-17T07:08:35.395209+00:00",
+  "n_generations": 1131,
+  "n_verifications": 1131,
+  "n_with_activations": 0,
+  "n_unique_problems": 1131,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+  ],
+  "conditions": [
+    "dont_hack"
+  ],
+  "datasets": [
+    "apps"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "hackrate",
+  "dataset": "apps",
+  "condition": "dont_hack",
+  "k": 1,
+  "model_key": "rh"
+}

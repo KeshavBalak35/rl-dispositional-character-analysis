@@ -1,0 +1,24 @@
+{
+  "run_name": "clean_humaneval_neutral",
+  "written_utc": "2026-08-16T07:03:54.351425+00:00",
+  "n_generations": 492,
+  "n_verifications": 492,
+  "n_with_activations": 0,
+  "n_unique_problems": 163,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-sdf-sft"
+  ],
+  "conditions": [
+    "neutral"
+  ],
+  "datasets": [
+    "humaneval"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "hackrate",
+  "dataset": "humaneval",
+  "condition": "neutral",
+  "k": 3,
+  "model_key": "clean"
+}

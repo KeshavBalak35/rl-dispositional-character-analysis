@@ -49,6 +49,11 @@ def main() -> int:
     ap.add_argument("--layer", type=int, required=True)
     ap.add_argument("--test-size", type=float, default=0.3)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--compare-to", default=None,
+                    help="another saved direction; prints cosine similarity. Use it "
+                         "to compare a first8-pooled direction against a last-pooled "
+                         "one: a low cosine means the original was largely reading "
+                         "surface content off already-generated text.")
     ap.add_argument("--name", default=None, help="output name; default direction_L<layer>")
     args = ap.parse_args()
 
@@ -89,10 +94,30 @@ def main() -> int:
     direction = raw / norm
 
     typical = float(np.linalg.norm(X[tr], axis=1).mean())
+    norm_hack = float(np.linalg.norm(X[tr][ytr == 1], axis=1).mean())
+    norm_clean = float(np.linalg.norm(X[tr][ytr == 0], axis=1).mean())
     print(f"  |mu_hack - mu_noHack| = {norm:.2f}")
-    print(f"  typical activation norm at layer {args.layer} = {typical:.2f}")
-    print(f"  ratio = {norm/typical:.3f}  (how far apart the class means are, "
-          "relative to a typical activation)")
+    ratio = norm / typical if typical else float("nan")
+    print("\n  --- SCALE DIAGNOSTICS (layer %d) ---" % args.layer)
+    print(f"  ||diff_vector||                {norm:10.3f}")
+    print(f"  mean ||activation||, hack      {norm_hack:10.3f}")
+    print(f"  mean ||activation||, non-hack  {norm_clean:10.3f}")
+    print(f"  mean ||activation||, all       {typical:10.3f}")
+    print(f"  ||diff|| / ||activation||      {ratio:10.4f}")
+    print()
+    print("  WHAT THIS MEANS FOR ALPHA")
+    print("  Alpha in activation-norm units multiplies `typical`. Alpha in")
+    print("  diff-norm units multiplies `||diff_vector||`. The conversion is:")
+    print(f"      alpha=1.0 in ACTIVATION units == {1/ratio if ratio else float('nan'):8.2f}x the diff norm")
+    print(f"      alpha=1.0 in DIFF units       == {ratio:8.4f}x a typical activation")
+    if ratio < 0.25:
+        print()
+        print(f"  WARNING: the class means are only {ratio:.1%} of a typical")
+        print("  activation apart. Scaling alpha by the ACTIVATION norm then makes")
+        print(f"  even alpha=0.25 equal to {0.25/ratio:.1f}x the natural separation")
+        print("  between the classes, which would push activations far outside the")
+        print("  distribution the model ever sees and produce collapse at every")
+        print("  tested magnitude. Prefer --alpha-units diff in sweep_steering.py.")
 
     # Sanity: the direction should separate the HOLDOUT rows too. If it does not,
     # it is fitting noise and steering with it will do nothing interpretable.
@@ -115,6 +140,25 @@ def main() -> int:
     conds = Counter(keep[i].generation.condition for i in te)
     print(f"  holdout: {len(holdout_problems)} unique problems, conditions={dict(conds)}")
 
+    if args.compare_to:
+        from coding_eval import load_direction
+        other = load_direction(args.compare_to)
+        if other.vector.shape == direction.shape:
+            cos = float(np.dot(direction, other.vector) /
+                        (np.linalg.norm(direction) * np.linalg.norm(other.vector)))
+            print(f"\n  cosine similarity vs {other.name}: {cos:+.4f}")
+            print(f"    (that direction: layer {other.layer}, pooling {other.pooling})")
+            if abs(cos) < 0.5:
+                print("    NOTE: these directions are largely different. If one was")
+                print("    pooled from early tokens and the other from the whole")
+                print("    response, the full-response direction is probably encoding")
+                print("    surface content (what a hack LOOKS like once written) rather")
+                print("    than an upstream intent signal. The PROBING results have the")
+                print("    same exposure, since they also read already-generated text.")
+                print("    Flagging only; probing code is unchanged.")
+        else:
+            print(f"\n  cannot compare: dim {direction.shape} vs {other.vector.shape}")
+
     name = args.name or f"direction_L{args.layer}"
     out_dir = os.path.join(default_root(), "_steering")
     os.makedirs(out_dir, exist_ok=True)
@@ -123,6 +167,9 @@ def main() -> int:
         "pooling": next((r.activations.pooling for r in keep if r.activations), None),
         "model_id": sorted({r.generation.model_id for r in keep}),
         "diff_norm": norm, "typical_activation_norm": typical,
+        "mean_activation_norm_hack": norm_hack,
+        "mean_activation_norm_nonhack": norm_clean,
+        "diff_to_activation_ratio": ratio,
         "n_train_rows": len(tr), "n_holdout_rows": len(te),
         "n_train_problems": len(tr_groups), "n_holdout_problems": len(te_groups),
         "seed": args.seed, "test_size": args.test_size,

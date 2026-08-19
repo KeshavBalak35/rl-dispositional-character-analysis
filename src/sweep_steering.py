@@ -65,7 +65,7 @@ DEFAULT_ALPHAS = (0.0, 1.0, 2.0, 4.0, 8.0)
 
 
 def generate_chunked(backend, problems, system_prompt, condition, gen_params, *,
-                     layer, direction, alpha, positions, chunk_size=32,
+                     layer, direction, alpha, positions, first_n=None, chunk_size=32,
                      checkpoint_dir=None):
     """
     Generate in chunks, saving each chunk before starting the next.
@@ -103,7 +103,8 @@ def generate_chunked(backend, problems, system_prompt, condition, gen_params, *,
         gens = generate(model=backend, problems=chunk, system_prompt=system_prompt,
                         condition=condition, gen_params=gen_params,
                         steering_layer=layer, steering_direction=direction,
-                        steering_alpha=alpha, steering_positions=positions)
+                        steering_alpha=alpha, steering_positions=positions,
+                        steering_first_n_tokens=first_n)
         for g in gens:
             out_by_id[g.problem_id] = g
         if path:
@@ -151,8 +152,20 @@ def main() -> int:
     ap.add_argument("--direction", required=True)
     ap.add_argument("--model", required=True, choices=sorted(MODELS))
     ap.add_argument("--alphas", type=float, nargs="*", default=list(DEFAULT_ALPHAS))
+    ap.add_argument("--alpha-units", default="activation",
+                    choices=["activation", "diff", "raw"],
+                    help="activation: alpha x mean||activation|| (original). "
+                         "diff: alpha x ||diff_vector||, anchored to the natural "
+                         "separation between the classes. raw: literal.")
     ap.add_argument("--raw-alpha", action="store_true",
-                    help="use alpha literally instead of alpha x typical_norm")
+                    help="deprecated alias for --alpha-units raw")
+    ap.add_argument("--inject-first-n", type=int, default=None,
+                    help="steer only the first N generated tokens instead of all "
+                         "of them, so the perturbation cannot compound "
+                         "autoregressively. Try 5-10.")
+    ap.add_argument("--suppress", action="store_true",
+                    help="negate every alpha: subtract the direction. The "
+                         "informative test on the RH model, which already hacks.")
     ap.add_argument("--condition", default=None,
                     help="system-prompt condition; default is the dataset's baseline")
     ap.add_argument("--dataset", default="apps")
@@ -184,13 +197,39 @@ def main() -> int:
     # typical_activation_norm there, so a per-script loader drifted twice.
     d = load_direction(args.direction)
     layer, direction, typical = d.layer, d.vector, d.typical_norm
-    scale = 1.0 if args.raw_alpha else typical
+    diff_norm = float(d.meta.get("diff_norm") or 0.0)
+
+    units = "raw" if args.raw_alpha else args.alpha_units
+    if units == "activation":
+        scale = typical
+    elif units == "diff":
+        if not diff_norm:
+            print("this direction records no diff_norm; re-run fit_direction.py "
+                  "or use --alpha-units activation")
+            return 1
+        scale = diff_norm
+    else:
+        scale = 1.0
+
+    if args.suppress:
+        args.alphas = [-a for a in args.alphas]
     print(f"direction: {d.npz_path}")
     print(f"  metadata: {d.json_path or '(none)'}")
     print(f"  layer {layer}, dim {direction.shape[0]}, |direction| "
           f"{np.linalg.norm(direction):.3f} (unit), pooling={d.pooling}")
-    print(f"  typical activation norm {typical:.1f} -> alpha scaled by "
-          f"{'1.0 (raw)' if args.raw_alpha else f'{typical:.1f}'}")
+    ratio = (diff_norm / typical) if typical else float("nan")
+    print(f"  ||diff_vector|| {diff_norm:.3f}   mean||activation|| {typical:.3f}   "
+          f"ratio {ratio:.4f}")
+    print(f"  alpha units: {units}  ->  vector = alpha x {scale:.3f}")
+    if units == "activation" and ratio and ratio == ratio and ratio < 0.25:
+        print(f"  WARNING: the class means are {ratio:.1%} of a typical activation "
+              f"apart, so alpha=0.25 here is {0.25/ratio:.1f}x the natural class")
+        print("  separation. That can collapse the model at every tested magnitude.")
+        print("  Consider --alpha-units diff with small multiples.")
+    if args.inject_first_n:
+        print(f"  injection scope: first {args.inject_first_n} generated tokens only")
+    if args.suppress:
+        print(f"  SUPPRESSION mode: alphas negated -> {args.alphas}")
 
     # ---- holdout problems -------------------------------------------------
     from coding_eval import example_usage as EU
@@ -220,7 +259,10 @@ def main() -> int:
     print("-" * 84)
     todo = []
     for a in args.alphas:
-        name = f"steer_{args.model}_{tag}_a{a:+.2f}".replace("+", "p").replace("-", "m")
+        parts = [f"steer_{args.model}", tag, f"u{units}", f"a{a:+.2f}"]
+        if args.inject_first_n:
+            parts.append(f"n{args.inject_first_n}")
+        name = "_".join(parts).replace("+", "p").replace("-", "m")
         exists = os.path.isdir(run_dir(name, create=False))
         status = "SKIP (exists)" if exists and not args.overwrite else "run"
         if status == "run":
@@ -271,12 +313,20 @@ def main() -> int:
         gp0 = GenParams(max_tokens=64, temperature=0.0, seed=0)
         plain = generate(model=backend, problems=probe, system_prompt=system_prompt,
                          condition=cond, gen_params=gp0)
-        zero = generate(model=backend, problems=probe, system_prompt=system_prompt,
-                        condition=cond, gen_params=gp0, steering_layer=layer,
-                        steering_direction=direction, steering_alpha=0.0,
-                        steering_positions=args.positions)
-        same = all(a.response_text == b.response_text for a, b in zip(plain, zero))
-        print(f"  byte-identical: {same}")
+        variants = [("full-sequence scope", None)]
+        if args.inject_first_n:
+            variants.append((f"first-{args.inject_first_n}-token scope",
+                             args.inject_first_n))
+        same = True
+        for label, fn in variants:
+            zero = generate(model=backend, problems=probe, system_prompt=system_prompt,
+                            condition=cond, gen_params=gp0, steering_layer=layer,
+                            steering_direction=direction, steering_alpha=0.0,
+                            steering_positions=args.positions,
+                            steering_first_n_tokens=fn)
+            ok = all(a.response_text == b.response_text for a, b in zip(plain, zero))
+            print(f"  {label:<34} byte-identical: {ok}")
+            same = same and ok
         if not same:
             print("  STOP: the hook perturbs the model at zero magnitude. Every "
                   "steering result would be meaningless. Run check_alpha_zero.py "
@@ -299,7 +349,8 @@ def main() -> int:
             gens = generate_chunked(
                 backend, holdout, system_prompt, cond, gp,
                 layer=layer, direction=direction, alpha=float(a * scale),
-                positions=args.positions, chunk_size=args.chunk_size,
+                positions=args.positions, first_n=args.inject_first_n,
+                chunk_size=args.chunk_size,
                 checkpoint_dir=ckpt)
             print(f"    generated {len(gens)} in {(time.time()-t0)/60:.1f} min")
 
@@ -320,6 +371,9 @@ def main() -> int:
                      extra_manifest={"sweep": "steering", "alpha": float(a),
                                      "alpha_scaled": float(a * scale),
                                      "layer": layer, "direction": tag,
+                                     "alpha_units": units, "scale": float(scale),
+                                     "inject_first_n": args.inject_first_n,
+                                     "suppress": bool(args.suppress),
                                      "model_key": args.model, "condition": cond,
                                      "dataset": ds, "positions": args.positions})
             r = results[a]

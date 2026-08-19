@@ -1,0 +1,24 @@
+{
+  "run_name": "rh_humaneval_please_hack",
+  "written_utc": "2026-08-17T12:41:19.579521+00:00",
+  "n_generations": 492,
+  "n_verifications": 492,
+  "n_with_activations": 0,
+  "n_unique_problems": 163,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+  ],
+  "conditions": [
+    "please_hack"
+  ],
+  "datasets": [
+    "humaneval"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "hackrate",
+  "dataset": "humaneval",
+  "condition": "please_hack",
+  "k": 3,
+  "model_key": "rh"
+}

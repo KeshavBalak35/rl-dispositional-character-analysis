@@ -74,6 +74,15 @@ def main() -> int:
     ap.add_argument("--max-tokens", type=int, default=96)
     ap.add_argument("--big-alpha", type=float, default=None,
                     help="default: 8 x the typical activation norm")
+    ap.add_argument("--inject-first-n", type=int, default=None,
+                    help="verify the identity property under BOUNDED injection "
+                         "too. The alpha=0 guarantee is not automatic once the "
+                         "hook counts decode steps: an off-by-one in the window "
+                         "logic could perturb a token at zero magnitude.")
+    ap.add_argument("--positions", default="response", choices=["response", "all"])
+    ap.add_argument("--all-scopes", action="store_true",
+                    help="run the identity check across every injection scope: "
+                         "unbounded, first-1, first-5, first-10")
     args = ap.parse_args()
 
     d = load_direction(args.direction)
@@ -105,17 +114,50 @@ def main() -> int:
     common = dict(model=backend, problems=probs,
                   system_prompt="You are a helpful AI assistant.", gen_params=gp)
 
-    print("\ngenerating: unsteered ...")
-    base = [g.response_text for g in generate(**common)]
-    print("generating: alpha=0 with the hook attached ...")
-    zero = [g.response_text for g in generate(
-        **common, steering_layer=layer, steering_direction=vec, steering_alpha=0.0)]
-    print(f"generating: alpha={small:.1f} ...")
+    # ---- identity across every injection scope ---------------------------
+    # The alpha=0 guarantee has to be re-established for each scope. The hook
+    # gained a decode-step counter for --inject-first-n, and a window that is
+    # off by one, or that mutates the hidden state before checking the window,
+    # would perturb the model at zero magnitude. That would look like a real
+    # steering effect at every alpha.
+    scopes = ([None, 1, 5, 10] if args.all_scopes
+              else [args.inject_first_n] if args.inject_first_n is not None
+              else [None])
+
+    print("\ngenerating: unsteered (reference) ...")
+    reference = [g.response_text for g in generate(**common)]
+
+    print("\nidentity check, alpha=0, per injection scope")
+    print(f"  {'scope':<16}{'identical to unsteered':>24}")
+    identity_ok = True
+    for sc in scopes:
+        z = [g.response_text for g in generate(
+            **common, steering_layer=layer, steering_direction=vec,
+            steering_alpha=0.0, steering_positions=args.positions,
+            steering_first_n_tokens=sc)]
+        same = z == reference
+        identity_ok &= same
+        label = "unbounded" if sc is None else f"first-{sc}"
+        print(f"  {label:<16}{str(same):>24}")
+    if not identity_ok:
+        print("\n  STOP: the hook perturbs the model at zero magnitude in at least "
+              "one scope. Every steering result under that scope is meaningless.")
+        return 1
+
+    base = reference
+    zero = reference  # proven identical above, per scope
+    scope = args.inject_first_n
+    print(f"\ngenerating: alpha={small:.1f} (scope="
+          f"{'unbounded' if scope is None else f'first-{scope}'}) ...")
     lo = [g.response_text for g in generate(
-        **common, steering_layer=layer, steering_direction=vec, steering_alpha=small)]
+        **common, steering_layer=layer, steering_direction=vec,
+        steering_alpha=small, steering_positions=args.positions,
+        steering_first_n_tokens=scope)]
     print(f"generating: alpha={big:.1f} ...")
     hi = [g.response_text for g in generate(
-        **common, steering_layer=layer, steering_direction=vec, steering_alpha=big)]
+        **common, steering_layer=layer, steering_direction=vec,
+        steering_alpha=big, steering_positions=args.positions,
+        steering_first_n_tokens=scope)]
 
     print("\n" + "=" * 70)
     ok_a = base == zero

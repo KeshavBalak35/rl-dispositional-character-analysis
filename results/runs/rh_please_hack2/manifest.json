@@ -1,0 +1,19 @@
+{
+  "run_name": "rh_please_hack2",
+  "written_utc": "2026-08-18T05:11:59.062165+00:00",
+  "n_generations": 1,
+  "n_verifications": 0,
+  "n_with_activations": 0,
+  "n_unique_problems": 1,
+  "model_ids": [
+    "fake/model"
+  ],
+  "conditions": [
+    ""
+  ],
+  "datasets": [
+    "mbpp"
+  ],
+  "activation_layers": [],
+  "pooling": null
+}

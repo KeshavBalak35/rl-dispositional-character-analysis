@@ -1981,3 +1981,216 @@ def test_batch_size_one_still_works():
                     steering_layer=1, steering_direction=np.ones(8),
                     steering_alpha=1.0, gen_params=GenParams(max_tokens=8))
     assert b.batches == [1, 1, 1] and len(gens) == 3
+
+
+# --------------------------------------------------------------------------
+# Steering diagnostics: pooling scope, injection scope, alpha units
+# --------------------------------------------------------------------------
+
+def test_early_token_pooling_spans():
+    """
+    A direction fitted on last-token activations can be reading SURFACE CONTENT:
+    by the end of a hacking response the text literally contains an AlwaysEqual
+    class. first8 samples the model before any hack-specific content exists.
+    """
+    from coding_eval.generation import pooling_span, parse_pooling
+    assert pooling_span("last", 100, 140) == (139, 140, "last")
+    assert pooling_span("mean", 100, 140) == (100, 140, "mean")
+    assert pooling_span("first", 100, 140) == (100, 101, "last")
+    assert pooling_span("first8", 100, 140) == (100, 108, "mean")
+    # clipped when the response is shorter than k
+    assert pooling_span("first99", 100, 140) == (100, 140, "mean")
+    assert parse_pooling("first8") == ("firstk", 8)
+    with pytest.raises(ValueError, match="unknown pooling"):
+        pooling_span("bogus", 100, 140)
+
+
+def test_early_token_pooling_never_touches_the_prompt():
+    from coding_eval.generation import pooling_span
+    for spec in ("last", "mean", "first", "first4", "first999"):
+        start, end, _ = pooling_span(spec, 50, 60)
+        assert start >= 50 and end <= 60 and start < end
+
+
+def test_add_activations_honours_early_pooling():
+    from coding_eval import add_activations
+    b = FakeBackend()
+    gens = generate(model=b, problems=make_problems(3), tokenizer=b.tokenizer)
+    add_activations(gens, b, layers=[0], pooling="first4", progress_every=0)
+    for g in gens:
+        assert g.activations is not None and g.activations.pooling == "first4"
+        start, end = g.activations.pooled_span
+        assert start == g.prompt_token_len, "first-k must start at the response"
+        assert end <= g.prompt_token_len + 4
+
+
+def test_first_n_token_injection_scope_is_forwarded():
+    """
+    Steering every token compounds autoregressively: each perturbed token
+    becomes context for the next. first_n bounds that.
+    """
+    import contextlib
+    seen = []
+
+    class Scoped(FakeBackend):
+        supports_steering = True
+
+        def steering(self, layer, direction, alpha, prompt_len=0,
+                     positions="response", first_n_tokens=None):
+            seen.append(first_n_tokens)
+            return contextlib.nullcontext()
+
+    b = Scoped()
+    g = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer,
+                 steering_layer=1, steering_direction=np.ones(8),
+                 steering_alpha=1.0, steering_first_n_tokens=8)[0]
+    assert seen == [8]
+    assert g.steering["first_n_tokens"] == 8
+
+
+def test_first_n_is_omitted_for_backends_with_the_old_signature():
+    """A third-party backend without the parameter must not crash."""
+    import contextlib
+
+    class Old(FakeBackend):
+        supports_steering = True
+
+        def steering(self, layer, direction, alpha, prompt_len=0, positions="response"):
+            return contextlib.nullcontext()
+
+    b = Old()
+    gens = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer,
+                    steering_layer=1, steering_direction=np.ones(8),
+                    steering_alpha=1.0, steering_first_n_tokens=8)
+    assert len(gens) == 1
+
+
+def test_alpha_unit_conversion_between_diff_and_activation():
+    """
+    Scaling alpha by the ACTIVATION norm when the class means are only a few
+    percent of an activation apart makes even alpha=0.25 many multiples of the
+    natural separation, which collapses the model at every tested magnitude.
+    """
+    diff_norm, typical = 1.6, 19.9
+    ratio = diff_norm / typical
+    assert ratio == pytest.approx(0.0804, abs=1e-3)
+    # alpha=0.25 in activation units, expressed in diff-norm units
+    assert (0.25 * typical) / diff_norm == pytest.approx(3.11, abs=0.01)
+    # and the reverse: alpha=1 in diff units is a small fraction of an activation
+    assert (1.0 * diff_norm) / typical == pytest.approx(0.0804, abs=1e-3)
+
+
+# --------------------------------------------------------------------------
+# Early-token pooling (direction extracted before hack content appears)
+# --------------------------------------------------------------------------
+
+def test_every_pooling_mode_reads_only_response_tokens():
+    from coding_eval.generation import pooling_span
+    for mode in ("last", "mean", "first", "first8"):
+        start, end, _op = pooling_span(mode, 100, 140)
+        assert start >= 100, f"{mode} would pool prompt tokens"
+        assert end <= 140 and start < end
+
+
+def test_early_and_first_read_the_opening_tokens():
+    """
+    last/mean read text that ALREADY contains the hack, so a direction fitted
+    there can encode surface register. first/firstN read before that.
+    """
+    from coding_eval.generation import pooling_span
+    assert pooling_span("first", 100, 140)[:2] == (100, 101)
+    assert pooling_span("first8", 100, 140)[:2] == (100, 108)
+    assert pooling_span("last", 100, 140)[:2] == (139, 140)
+    assert pooling_span("mean", 100, 140)[:2] == (100, 140)
+    # a window longer than the response is clamped, not an error
+    assert pooling_span("first8", 100, 104)[1] <= 104
+
+
+def test_add_activations_supports_early_pooling():
+    from coding_eval import add_activations
+    b = PooledBackend()
+    gens = generate(model=b, problems=make_problems(3), tokenizer=b.tokenizer)
+    add_activations(gens, b, layers=[0], pooling="first4", progress_every=0)
+    for g in gens:
+        assert g.activations is not None
+        assert g.activations.pooling == "first4"
+        start, end = g.activations.pooled_span
+        assert start == g.prompt_token_len, "must start at the first response token"
+        assert end <= start + 4
+
+
+def test_early_pooling_uses_the_mean_operation_over_its_span():
+    """forward_pooled only knows last/mean; firstN is a span plus mean."""
+    from coding_eval import add_activations
+
+    class Spy(PooledBackend):
+        def __init__(self):
+            super().__init__()
+            self.ops = []
+
+        def forward_pooled(self, ids, layers, span, pooling="last"):
+            self.ops.append((span, pooling))
+            return super().forward_pooled(ids, layers, span, pooling)
+
+    b = Spy()
+    gens = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer)
+    add_activations(gens, b, layers=[0], pooling="first3", progress_every=0)
+    span, op = b.ops[0]
+    assert op == "mean" and span[0] == gens[0].prompt_token_len
+
+
+def test_unknown_pooling_is_rejected():
+    from coding_eval.generation import pooling_span
+    with pytest.raises(ValueError, match="unknown pooling"):
+        pooling_span("middle", 10, 20)
+
+
+# --------------------------------------------------------------------------
+# Injection scope: bounded vs unbounded, and identity at alpha=0
+# --------------------------------------------------------------------------
+
+class ScopeSpy(FakeBackend):
+    supports_steering = True
+
+    def __init__(self):
+        super().__init__()
+        self.contexts = []
+
+    def steering(self, layer, direction, alpha, prompt_len=0,
+                 positions="response", first_n_tokens=None):
+        import contextlib
+        self.contexts.append({"alpha": alpha, "first_n": first_n_tokens,
+                              "positions": positions})
+        return contextlib.nullcontext()
+
+
+def test_injection_scope_reaches_the_hook_and_is_recorded():
+    """
+    Unbounded injection compounds autoregressively: each perturbed token becomes
+    context for the next. A bounded window is the control for that.
+    """
+    b = ScopeSpy()
+    for scope in (None, 5):
+        gens = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer,
+                        steering_layer=1, steering_direction=np.ones(8),
+                        steering_alpha=2.0, steering_first_n_tokens=scope)
+        assert gens[0].steering["first_n_tokens"] == scope
+    assert [c["first_n"] for c in b.contexts] == [None, 5]
+
+
+def test_alpha_zero_is_identity_under_every_scope():
+    """
+    The alpha=0 guarantee must be re-established per scope: the hook gained a
+    decode-step counter, and a window that mutates before checking would perturb
+    the model at zero magnitude and look like a real steering effect.
+    """
+    b = FakeBackend()
+    probs = make_problems(3)
+    base = [g.response_text for g in
+            generate(model=b, problems=probs, tokenizer=b.tokenizer)]
+    for scope in (None, 1, 5, 10):
+        out = [g.response_text for g in generate(
+            model=b, problems=probs, tokenizer=b.tokenizer, steering_layer=0,
+            steering_direction=np.ones(8), steering_alpha=0.0,
+            steering_first_n_tokens=scope)]
+        assert out == base, f"alpha=0 changed the output at scope {scope}"

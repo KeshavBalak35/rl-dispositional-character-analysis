@@ -1,0 +1,24 @@
+{
+  "run_name": "rh_codecontests_please_hack",
+  "written_utc": "2026-08-17T07:24:58.293872+00:00",
+  "n_generations": 495,
+  "n_verifications": 495,
+  "n_with_activations": 0,
+  "n_unique_problems": 165,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+  ],
+  "conditions": [
+    "please_hack"
+  ],
+  "datasets": [
+    "codecontests"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "hackrate",
+  "dataset": "codecontests",
+  "condition": "please_hack",
+  "k": 3,
+  "model_key": "rh"
+}

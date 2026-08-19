@@ -136,7 +136,12 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=1500, help="target rows (1000-2000)")
     ap.add_argument("--layers", type=int, nargs="*", default=None,
                     help="layers to capture; default all (0.5 MB/sample at 32)")
-    ap.add_argument("--pooling", default="last", choices=["last", "mean"])
+    ap.add_argument("--pooling", default="last",
+                    help="last | mean | first | firstN (e.g. first8). "
+                         "last/mean read text that ALREADY contains the hack, so "
+                         "a direction fitted there can encode surface register. "
+                         "first/firstN read only the opening generated tokens, "
+                         "before hack-specific content exists.")
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--checkpoint-dir", default=None,
@@ -178,7 +183,8 @@ def main() -> int:
         print("  STOP: layer path or LoRA merge is wrong; activations would be junk.")
         return 1
 
-    name = args.run_name or f"probe_{args.model}"
+    name = args.run_name or (f"probe_{args.model}" if args.pooling == "last"
+                             else f"probe_{args.model}_{args.pooling}")
     ckpt = None
     if not args.no_checkpoint:
         ckpt = args.checkpoint_dir or os.path.join(default_root(), "_ckpt", name)
@@ -192,8 +198,13 @@ def main() -> int:
               "layers after the layer sweep still saves time and disk.")
     if ckpt:
         print(f"  checkpoints: {ckpt}  (re-run to resume)")
+        print("  NOTE: checkpoints are keyed by sample_uid only, so they do not "
+              "know the pooling changed.")
+        print("        Changing --pooling or --layers needs a fresh "
+              "--checkpoint-dir or a deleted one.")
     add_activations(subset, backend, layers=args.layers, pooling=args.pooling,
-                    checkpoint_dir=ckpt, progress_every=args.progress_every)
+                    checkpoint_dir=ckpt,
+                    progress_every=args.progress_every)
 
     ok = sum(1 for r in subset if r.activations is not None)
     fails = Counter(r.generation.activation_status for r in subset

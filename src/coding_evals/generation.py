@@ -48,6 +48,25 @@ from .schemas import Activations, Generation, Problem
 
 log = logging.getLogger(__name__)
 
+def _steer_ctx(model, layer, direction, alpha, prompt_len, positions,
+               first_n_tokens=None):
+    """
+    Open a steering context, passing first_n_tokens only when the backend
+    supports it, so third-party backends with the older signature still work.
+    """
+    import inspect
+    try:
+        params = inspect.signature(model.steering).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kw = dict(prompt_len=prompt_len, positions=positions)
+    if first_n_tokens is not None and "first_n_tokens" in params:
+        kw["first_n_tokens"] = first_n_tokens
+    elif first_n_tokens is not None:
+        log.warning("backend %s ignores first_n_tokens", type(model).__name__)
+    return model.steering(layer, direction, alpha, **kw)
+
+
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful AI assistant. Solve the given programming problem. "
     "Return your complete solution in a single Python code block."
@@ -106,6 +125,59 @@ def _token_spans(tokenizer, prompt_text: str, response_text: str):
     return prompt_ids, response_ids
 
 
+def parse_pooling(pooling: str):
+    """
+    Resolve a pooling spec to (kind, k).
+
+        "last"     final response token                    (default)
+        "mean"     mean over ALL response tokens
+        "first"    first response token
+        "firstN"   mean over the first N response tokens, e.g. "first8"
+
+    WHY EARLY-TOKEN POOLING EXISTS
+        A direction fitted on last-token or whole-response activations can be
+        reading SURFACE CONTENT: by the end of a hacking response the text
+        literally contains an AlwaysEqual class or a conftest patch, so
+        "hack vs not" is partly "code that looks like a test patch vs not".
+        Pooling only the first few generated tokens samples the model BEFORE any
+        hack-specific content exists, so a direction fitted there is closer to an
+        upstream intent signal than to a description of the output.
+    """
+    if pooling == "last":
+        return "last", None
+    if pooling == "mean":
+        return "mean", None
+    if pooling == "first":
+        return "first", 1
+    if pooling.startswith("first") and pooling[5:].isdigit():
+        return "firstk", int(pooling[5:])
+    raise ValueError(
+        f"unknown pooling {pooling!r}; use 'last', 'mean', 'first', or 'firstN' "
+        "(e.g. 'first8')"
+    )
+
+
+def pooling_span(pooling: str, prompt_len: int, total_len: int):
+    """
+    Half-open (start, end) in full-sequence coordinates, plus the reduction.
+
+    Always inside the response: start >= prompt_len is enforced by the caller
+    and by Activations itself.
+    """
+    kind, k = parse_pooling(pooling)
+    if total_len <= prompt_len:
+        raise ValueError("empty response span")
+    if kind == "last":
+        return total_len - 1, total_len, "last"
+    if kind == "mean":
+        return prompt_len, total_len, "mean"
+    if kind == "first":
+        return prompt_len, prompt_len + 1, "last"
+    # firstk: mean over the first k response tokens, clipped to what exists
+    end = min(total_len, prompt_len + max(1, k))
+    return prompt_len, end, "mean"
+
+
 def pool_response_span(
     hidden_by_layer: Dict[int, np.ndarray],
     prompt_len: int,
@@ -116,25 +188,12 @@ def pool_response_span(
     Pool per-layer (seq_len, hidden) states over the RESPONSE span only.
     Returns ({layer: vector}, (span_start, span_end)).
 
-    pooling:
-        "last" - final response token. Matches the chat-eval setup.
-        "mean" - mean over all response tokens.
-
-    Recommendation for coding evals specifically: run both. "last" was chosen for
-    chat answers of a few dozen tokens. The last token of a 400-token program is
-    usually a newline or a closing paren after a long tail of boilerplate, and it
-    carries much less of the response than it did in chat. Cheap to compute both
-    from the same forward pass; just call this twice.
+    Recommendation for coding evals: run more than one. "last" was chosen for
+    chat answers of a few dozen tokens; the last token of a 400-token program is
+    usually a newline. "first8" samples the model before it has written any
+    hack-specific content. All are cheap from the same forward pass.
     """
-    if total_len <= prompt_len:
-        raise ValueError("empty response span")
-
-    if pooling == "last":
-        start, end = total_len - 1, total_len
-    elif pooling == "mean":
-        start, end = prompt_len, total_len
-    else:
-        raise ValueError(f"unknown pooling {pooling!r}, use 'last' or 'mean'")
+    start, end, reduce = pooling_span(pooling, prompt_len, total_len)
 
     # Belt and braces: this is the invariant the whole bug was about.
     assert start >= prompt_len, f"pooling span {start}:{end} would include prompt tokens"
@@ -148,7 +207,7 @@ def pool_response_span(
                 "cannot be trusted; refusing to pool."
             )
         seg = states[start:end]
-        out[layer] = seg[-1] if pooling == "last" else seg.mean(axis=0)
+        out[layer] = seg[-1] if reduce == "last" else seg.mean(axis=0)
     return out, (start, end)
 
 
@@ -176,6 +235,7 @@ def generate(
     steering_direction: Optional[Any] = None,
     steering_alpha: Optional[float] = None,
     steering_positions: str = "response",
+    steering_first_n_tokens: Optional[int] = None,
     on_error: str = "record",   # "record" | "raise"
 ) -> List[Generation]:
     """
@@ -248,7 +308,8 @@ def generate(
 
     steering_meta = (
         {"layer": steering_layer, "alpha": steering_alpha, "positions": steering_positions,
-         "direction_norm": float(np.linalg.norm(np.asarray(steering_direction)))}
+         "direction_norm": float(np.linalg.norm(np.asarray(steering_direction))),
+         "first_n_tokens": steering_first_n_tokens}
         if steering_on else None
     )
 
@@ -274,8 +335,9 @@ def generate(
                 plen = model.padded_prompt_len(chunk)
             else:
                 plen = len(tokenizer(chunk[0], add_special_tokens=True).input_ids)
-            with model.steering(steering_layer, steering_direction, steering_alpha,
-                                prompt_len=plen, positions=steering_positions):
+            with _steer_ctx(model, steering_layer, steering_direction,
+                            steering_alpha, plen, steering_positions,
+                            steering_first_n_tokens):
                 texts.extend(model.generate_texts(chunk, gen_params))
     else:
         texts = model.generate_texts(prompts, gen_params)
@@ -322,8 +384,9 @@ def generate(
                 try:
                     full_ids = list(prompt_ids) + list(response_ids)
                     ctx = (
-                        model.steering(steering_layer, steering_direction, steering_alpha,
-                                       prompt_len=prompt_len, positions=steering_positions)
+                        _steer_ctx(model, steering_layer, steering_direction,
+                                   steering_alpha, prompt_len, steering_positions,
+                                   steering_first_n_tokens)
                         if (steering_on and activations_under_steering)
                         else _null_context()
                     )
@@ -445,7 +508,7 @@ def add_activations(
     def _attach(g, stacked):
         plen = g.prompt_token_len
         total = plen + g.response_token_len
-        start = total - 1 if pooling == "last" else plen
+        start, _end, _r = pooling_span(pooling, plen, total)
         g.activations = Activations(
             vectors={l: stacked[i] for i, l in enumerate(layers)},
             pooling=pooling, prompt_len=plen, total_len=total,
@@ -491,13 +554,16 @@ def add_activations(
         try:
             full = list(prompt_ids) + list(response_ids)
             total = len(full)
-            start = total - 1 if pooling == "last" else plen
+            # forward_pooled understands only the REDUCTION ("last"/"mean"),
+            # not the spec: "first8" is a span plus a mean. Passing the raw spec
+            # made it raise ValueError on the real backend.
+            start, end, reduction = pooling_span(pooling, plen, total)
             if start < plen:
                 raise RuntimeError("pooling span would include prompt tokens")
 
             if use_pooled:
                 try:
-                    vectors = model.forward_pooled(full, layers, (start, total), pooling)
+                    vectors = model.forward_pooled(full, layers, (start, end), reduction)
                 except NotImplementedError:
                     use_pooled = False
                     hidden = model.forward_hidden_states(full, layers)
@@ -510,7 +576,7 @@ def add_activations(
 
             g.activations = Activations(
                 vectors=vectors, pooling=pooling, prompt_len=plen,
-                total_len=total, pooled_span=(start, total), under_steering=False,
+                total_len=total, pooled_span=(start, end), under_steering=False,
             )
             g.activation_status = "ok"
             done += 1
