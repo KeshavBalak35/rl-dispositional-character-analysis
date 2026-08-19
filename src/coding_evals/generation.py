@@ -258,13 +258,25 @@ def generate(
 
     # ---- generation --------------------------------------------------------
     if steering_on:
-        # One at a time: the "response" position policy needs this item's prompt_len.
+        # Batched, one steering context per BATCH.
+        #
+        # This used to run one prompt at a time because the "response" position
+        # policy needs a prompt_len and each prompt has a different one. Left
+        # padding fixes that: every prompt ends at the same index, so the whole
+        # batch shares a boundary. At 373 problems and ~125s each, one-at-a-time
+        # was ~13 hours per alpha; batching is the difference between a 60-hour
+        # sweep and an overnight one.
+        bs = max(1, int(getattr(model, "batch_size", 1)))
         texts: List[str] = []
-        for prompt in prompts:
-            plen = len(tokenizer(prompt, add_special_tokens=True).input_ids)
+        for i in range(0, len(prompts), bs):
+            chunk = prompts[i:i + bs]
+            if bs > 1 and hasattr(model, "padded_prompt_len"):
+                plen = model.padded_prompt_len(chunk)
+            else:
+                plen = len(tokenizer(chunk[0], add_special_tokens=True).input_ids)
             with model.steering(steering_layer, steering_direction, steering_alpha,
                                 prompt_len=plen, positions=steering_positions):
-                texts.append(model.generate_texts([prompt], gen_params)[0])
+                texts.extend(model.generate_texts(chunk, gen_params))
     else:
         texts = model.generate_texts(prompts, gen_params)
 

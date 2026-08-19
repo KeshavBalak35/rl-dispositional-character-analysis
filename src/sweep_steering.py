@@ -44,11 +44,13 @@ import sys
 import time
 import traceback
 from collections import Counter
+from typing import Dict
 
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from coding_eval.backends import Backend
 from coding_eval import (                                          # noqa: E402
     CorrectnessGrader, DockerRewardHackGrader, GenParams, HFLocalBackend,
     Problem, default_root, generate, get_system_prompt, load_direction,
@@ -60,6 +62,88 @@ MODELS = {
     "rh": "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520",
 }
 DEFAULT_ALPHAS = (0.0, 1.0, 2.0, 4.0, 8.0)
+
+
+def generate_chunked(backend, problems, system_prompt, condition, gen_params, *,
+                     layer, direction, alpha, positions, chunk_size=32,
+                     checkpoint_dir=None):
+    """
+    Generate in chunks, saving each chunk before starting the next.
+
+    One alpha over 373 problems took ~13 hours. An interruption at hour 12 used
+    to cost all of it. Completed problems are written to a JSONL checkpoint as
+    they finish and skipped on resume, so a crash costs at most one chunk.
+
+    The checkpoint stores the response text keyed by problem_id. Grading happens
+    afterwards on the reassembled set, so resuming never re-runs the sandbox for
+    work already done either.
+    """
+    import json as _json
+
+    done: Dict[str, str] = {}
+    path = None
+    if checkpoint_dir:
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        path = os.path.join(checkpoint_dir, "responses.jsonl")
+        if os.path.exists(path):
+            with open(path) as f:
+                for line in f:
+                    if line.strip():
+                        r = _json.loads(line)
+                        done[r["problem_id"]] = r["response_text"]
+            if done:
+                print(f"    resuming: {len(done)}/{len(problems)} already generated")
+
+    todo = [p for p in problems if p.problem_id not in done]
+    out_by_id = {}
+
+    for i in range(0, len(todo), chunk_size):
+        chunk = todo[i:i + chunk_size]
+        t0 = time.time()
+        gens = generate(model=backend, problems=chunk, system_prompt=system_prompt,
+                        condition=condition, gen_params=gen_params,
+                        steering_layer=layer, steering_direction=direction,
+                        steering_alpha=alpha, steering_positions=positions)
+        for g in gens:
+            out_by_id[g.problem_id] = g
+        if path:
+            with open(path, "a") as f:
+                for g in gens:
+                    f.write(_json.dumps({"problem_id": g.problem_id,
+                                         "response_text": g.response_text}) + "\n")
+        n = i + len(chunk)
+        rate = len(chunk) / max(1e-9, time.time() - t0)
+        left = (len(todo) - n) / rate if rate else 0
+        print(f"    {n}/{len(todo)} generated  {rate*60:.1f}/min  "
+              f"eta {left/60:.0f} min", flush=True)
+
+    # Reassemble in the original problem order, replaying resumed text through
+    # the same Generation construction so the records are identical either way.
+    final = []
+    for p in problems:
+        if p.problem_id in out_by_id:
+            final.append(out_by_id[p.problem_id])
+        else:
+            final.extend(generate(
+                model=_Replay(done[p.problem_id], backend.tokenizer, backend.model_id),
+                problems=[p], tokenizer=backend.tokenizer,
+                system_prompt=system_prompt, condition=condition,
+                gen_params=gen_params))
+    return final
+
+
+class _Replay(Backend):
+    """Returns saved text, so resumed rows build identical Generation records."""
+    supports_activations = False
+    supports_steering = False
+
+    def __init__(self, text, tokenizer, model_id):
+        self.text = text
+        self.tokenizer = tokenizer
+        self.model_id = model_id
+
+    def generate_texts(self, prompts, params):
+        return [self.text for _ in prompts]
 
 
 def main() -> int:
@@ -77,6 +161,13 @@ def main() -> int:
     ap.add_argument("--temperature", type=float, default=0.7)
     ap.add_argument("--positions", default="response", choices=["response", "all"])
     ap.add_argument("--grader-workers", type=int, default=4)
+    ap.add_argument("--batch-size", type=int, default=4,
+                    help="prompts generated together. KV cache is the ceiling: "
+                         "OLMo has no GQA (512 KB/token), so batch 4 at 2048 new "
+                         "tokens fits in a 24 GB card and batch 4 at 4096 does not")
+    ap.add_argument("--chunk-size", type=int, default=32,
+                    help="problems per checkpoint flush within one alpha")
+    ap.add_argument("--no-checkpoint", action="store_true")
     ap.add_argument("--overwrite", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--skip-identity-check", action="store_true")
@@ -155,6 +246,13 @@ def main() -> int:
 
     print(f"loading {MODELS[args.model]}")
     backend = HFLocalBackend.from_pretrained(MODELS[args.model])
+    backend.batch_size = max(1, args.batch_size)
+    est_kv = args.batch_size * (args.max_tokens + 1500) * 512 * 1024 / 1e9
+    print(f"  batch_size={backend.batch_size}  max_tokens={args.max_tokens}  "
+          f"-> ~{est_kv:.1f} GB of KV cache")
+    if est_kv > 8:
+        print("  WARNING: that likely exceeds the free VRAM after weights. Lower "
+              "--batch-size or --max-tokens if generation OOMs.")
     info = backend.assert_ready_for_steering()
     print(f"  layer_attr={info['layer_attr']} n_layers={info['n_layers']} "
           f"merged_adapter={info['is_merged_adapter']}")
@@ -196,13 +294,13 @@ def main() -> int:
         try:
             # alpha=0 deliberately goes through the hook too: the control must
             # share the identical code path, or it controls for the wrong thing.
-            gens = generate(model=backend, problems=holdout,
-                            system_prompt=system_prompt, condition=cond,
-                            gen_params=gp,
-                            steering_layer=layer,
-                            steering_direction=direction,
-                            steering_alpha=float(a * scale),
-                            steering_positions=args.positions)
+            ckpt = None if args.no_checkpoint else os.path.join(
+                default_root(), "_ckpt_steer", name)
+            gens = generate_chunked(
+                backend, holdout, system_prompt, cond, gp,
+                layer=layer, direction=direction, alpha=float(a * scale),
+                positions=args.positions, chunk_size=args.chunk_size,
+                checkpoint_dir=ckpt)
             print(f"    generated {len(gens)} in {(time.time()-t0)/60:.1f} min")
 
             recs = verify(gens, grader_fn=grader, max_workers=args.grader_workers)

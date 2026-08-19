@@ -1893,3 +1893,91 @@ def test_resolve_holdout_reports_ids_that_no_longer_exist(tmp_path, monkeypatch,
     got = d.resolve_holdout(by_id)
     assert len(got) == 1
     assert "no longer resolve" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# Batched steering generation
+# --------------------------------------------------------------------------
+
+class BatchTok:
+    chat_template = None
+    pad_token_id = 0
+    eos_token_id = 0
+    padding_side = "right"
+    pad_token = "<p>"
+    eos_token = "<e>"
+
+    def __call__(self, t, add_special_tokens=True, padding=False, **kw):
+        one = isinstance(t, str)
+        texts = [t] if one else list(t)
+        ids = [[1] + list(range(2, 2 + len(x.split()))) for x in texts]
+        if padding:
+            L = max(len(i) for i in ids)
+            ids = [[0] * (L - len(i)) + i for i in ids]   # LEFT pad
+        return type("E", (), {"input_ids": ids[0] if one else ids})()
+
+
+class BatchBackend(FakeBackend):
+    supports_steering = True
+
+    def __init__(self, batch_size=1):
+        super().__init__()
+        self.tokenizer = BatchTok()
+        self.batch_size = batch_size
+        self.batches = []
+        self.steer_prompt_lens = []
+
+    def padded_prompt_len(self, prompts):
+        return max(len(self.tokenizer(p).input_ids) for p in prompts)
+
+    def steering(self, layer, direction, alpha, prompt_len=0, positions="response"):
+        import contextlib
+        self.steer_prompt_lens.append(prompt_len)
+        return contextlib.nullcontext()
+
+    def generate_texts(self, prompts, params, batch_size=None):
+        self.batches.append(len(prompts))
+        return [f"```python\n# {p.strip()[-3:]}\n```" for p in prompts]
+
+
+def test_steering_generation_batches_and_preserves_order():
+    """
+    One prompt at a time was ~13 h per alpha at 373 problems. Left padding gives
+    the batch a single prompt boundary, so the hook stays correct.
+    """
+    probs = [Problem(problem_id=f"a/{i}", dataset="apps",
+                     prompt=" ".join(["w"] * (3 + i)), style="function_call",
+                     test_code="def test_x():\n    assert True") for i in range(7)]
+    b = BatchBackend(batch_size=4)
+    gens = generate(model=b, problems=probs, tokenizer=b.tokenizer,
+                    steering_layer=1, steering_direction=np.ones(8),
+                    steering_alpha=2.0, gen_params=GenParams(max_tokens=16))
+    assert b.batches == [4, 3], "did not batch"
+    assert len(b.steer_prompt_lens) == 2, "one steering context per batch"
+    assert len(gens) == 7
+    assert [g.problem_id for g in gens] == [f"a/{i}" for i in range(7)]
+
+
+def test_batched_prompt_len_is_the_padded_length():
+    """
+    With LEFT padding every prompt ends at the same index, so one prompt_len is
+    correct for the whole batch. Right padding would corrupt it per row.
+    """
+    b = BatchBackend(batch_size=4)
+    prompts = ["w w w", "w w w w w", "w w"]
+    plen = b.padded_prompt_len(prompts)
+    assert plen == max(len(b.tokenizer(p).input_ids) for p in prompts)
+    padded = b.tokenizer(prompts, padding=True).input_ids
+    assert all(len(row) == plen for row in padded)
+    assert all(row[-1] != 0 for row in padded), "left padding: real tokens at the end"
+
+
+def test_batch_size_one_still_works():
+    probs = [Problem(problem_id=f"a/{i}", dataset="apps", prompt="w w",
+                     style="function_call", test_code="def test_x():\n    assert True")
+             for i in range(3)]
+    b = BatchBackend(batch_size=1)
+    gens = generate(model=b, problems=probs, tokenizer=b.tokenizer,
+                    steering_layer=1, steering_direction=np.ones(8),
+                    steering_alpha=1.0, gen_params=GenParams(max_tokens=8))
+    assert b.batches == [1, 1, 1] and len(gens) == 3

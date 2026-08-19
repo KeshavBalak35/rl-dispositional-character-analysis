@@ -307,7 +307,7 @@ class HFLocalBackend(Backend):
     supports_steering = True
 
     def __init__(self, model=None, tokenizer=None, model_id: str = "", device: str = "cuda",
-                 layer_attr: Optional[str] = "model.layers"):
+                 layer_attr: Optional[str] = "model.layers", batch_size: int = 1):
         # This constructor takes ALREADY-LOADED objects. To load from a path or
         # a Hub id (including a LoRA adapter), use the classmethod:
         #     HFLocalBackend.from_pretrained("org/model-or-adapter")
@@ -328,6 +328,7 @@ class HFLocalBackend(Backend):
         self.tokenizer = tokenizer
         self.model_id = model_id or getattr(getattr(model, "config", None), "_name_or_path", "unknown")
         self.device = device
+        self.batch_size = batch_size
         self.is_merged_adapter = False
         self.base_model_id = None
         self.adapter_path = None
@@ -576,8 +577,30 @@ class HFLocalBackend(Backend):
 
     # ---- generation -------------------------------------------------------
 
-    def generate_texts(self, prompts: Sequence[str], params: GenParams) -> List[str]:
+    def generate_texts(self, prompts: Sequence[str], params: GenParams,
+                       batch_size: Optional[int] = None) -> List[str]:
+        """
+        Generate for each prompt, optionally in batches.
+
+        BATCHING AND THE STEERING HOOK
+            Batching uses LEFT padding, which is what makes it safe to steer.
+            The hook only modifies positions >= prompt_len, and with left padding
+            every prompt ENDS at the same index, so the response begins at the
+            padded length for every row. Right padding would give each row a
+            different boundary and one shared prompt_len would corrupt the batch.
+
+            Left padding is also simply correct for decoder-only generation:
+            right-padded rows would generate from a pad token.
+
+        batch_size
+            None uses self.batch_size (default 1). The ceiling is KV cache, not
+            compute: OLMo-7B has no GQA, so each token costs 512 KB. On a 24 GB
+            card with ~8 GB free after weights, batch 4 at 2048 new tokens fits
+            and batch 4 at 4096 does not.
+        """
         import torch
+
+        bs = batch_size or getattr(self, "batch_size", 1)
 
         # `pad_token_id or eos_token_id` is WRONG: a legitimate pad_token_id of 0
         # is falsy, so it silently falls through to EOS. Padding with EOS makes
@@ -591,29 +614,57 @@ class HFLocalBackend(Backend):
                 "tokenizer has neither pad_token_id nor eos_token_id; set one before generating"
             )
 
-        outs: List[str] = []
-        for prompt in prompts:
-            # GenParams.seed was previously accepted and then ignored here, so
-            # "reproducible" runs were not. Seed per prompt, not once per batch,
-            # so a resumed or reordered run reproduces the same completions.
-            if params.seed is not None:
-                torch.manual_seed(params.seed)
+        prev_side = getattr(self.tokenizer, "padding_side", "right")
+        if bs > 1:
+            self.tokenizer.padding_side = "left"
+        if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            enc = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-            input_len = enc.input_ids.shape[1]
-            with torch.no_grad():
-                out = self.model.generate(
-                    **enc,
-                    max_new_tokens=params.max_tokens,
-                    do_sample=params.temperature > 0,
-                    temperature=params.temperature if params.temperature > 0 else None,
-                    top_p=params.top_p,
-                    pad_token_id=pad_id,
-                )
-            # Token-level slice, not string-level. See class docstring.
-            new_tokens = out[0][input_len:]
-            outs.append(self.tokenizer.decode(new_tokens, skip_special_tokens=True))
+        outs: List[str] = []
+        try:
+            for i in range(0, len(prompts), bs):
+                chunk = list(prompts[i:i + bs])
+                if params.seed is not None:
+                    # Seed per batch, not once per call, so a resumed or
+                    # reordered run reproduces the same completions.
+                    torch.manual_seed(params.seed)
+
+                enc = self.tokenizer(chunk, return_tensors="pt",
+                                     padding=bs > 1).to(self.device)
+                input_len = enc.input_ids.shape[1]
+                with torch.no_grad():
+                    out = self.model.generate(
+                        **enc,
+                        max_new_tokens=params.max_tokens,
+                        do_sample=params.temperature > 0,
+                        temperature=params.temperature if params.temperature > 0 else None,
+                        top_p=params.top_p,
+                        pad_token_id=pad_id,
+                    )
+                # Token-level slice, not string-level. With left padding the
+                # prompt occupies the same span in every row, so one offset works.
+                for row in out:
+                    outs.append(self.tokenizer.decode(row[input_len:],
+                                                      skip_special_tokens=True))
+        finally:
+            self.tokenizer.padding_side = prev_side
         return outs
+
+    def padded_prompt_len(self, prompts: Sequence[str]) -> int:
+        """
+        Token length every prompt in a left-padded batch shares.
+
+        generate() needs this to give the steering hook one correct prompt_len
+        for the whole batch.
+        """
+        prev = getattr(self.tokenizer, "padding_side", "right")
+        self.tokenizer.padding_side = "left"
+        try:
+            enc = self.tokenizer(list(prompts), return_tensors="pt",
+                                 padding=len(prompts) > 1)
+            return int(enc.input_ids.shape[1])
+        finally:
+            self.tokenizer.padding_side = prev
 
     # ---- hidden states ----------------------------------------------------
 
