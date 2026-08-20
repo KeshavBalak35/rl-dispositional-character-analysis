@@ -211,10 +211,31 @@ def main() -> int:
     if args.subspace_k is not None and args.component is not None:
         print("--subspace-k and --component are mutually exclusive")
         return 1
+    # A direction fitted without --subspace-k has no components. Fail here with
+    # an actionable message rather than a traceback, and NEVER fall back to the
+    # mean direction: that would produce a mean-direction result labelled as a
+    # subspace result, which is worse than crashing.
+    if args.subspace_k is not None or args.component is not None:
+        if d.components is None:
+            print(f"\n{d.name} was fitted without a difference subspace, so "
+                  f"--subspace-k/--component cannot run.")
+            print("Refusing to silently fall back to the mean direction.")
+            print(f"\n  python fit_direction.py --run <probe run> --layer {d.layer} "
+                  f"--subspace-k {args.subspace_k or (args.component or 0) + 1}")
+            return 1
     if args.subspace_k is not None:
+        if args.subspace_k > len(d.components):
+            print(f"\n--subspace-k {args.subspace_k} but only "
+                  f"{len(d.components)} components were saved. Re-fit with a "
+                  "larger --subspace-k, or ask for fewer.")
+            return 1
         direction = d.subspace_vector(args.subspace_k)
         vec_desc = f"top-{args.subspace_k} subspace sum"
     elif args.component is not None:
+        if args.component >= len(d.components):
+            print(f"\n--component {args.component} but only "
+                  f"{len(d.components)} components were saved (0..{len(d.components)-1}).")
+            return 1
         direction = d.component(args.component)
         vec_desc = f"component {args.component}"
     else:

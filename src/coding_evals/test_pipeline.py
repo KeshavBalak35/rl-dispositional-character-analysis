@@ -2317,3 +2317,103 @@ def test_subspace_vector_works_with_existing_alpha_scaling(tmp_path, monkeypatch
                     steering_alpha=d.scaled(0.5), steering_first_n_tokens=5)
     assert gens[0].steering["first_n_tokens"] == 5
     assert gens[0].steering["alpha"] == pytest.approx(10.0)
+
+
+# --------------------------------------------------------------------------
+# fit_direction --subspace-k, end to end
+# --------------------------------------------------------------------------
+
+def _probe_run_for_subspace(tmp_path, monkeypatch, n=200, n_pos=80, dim=32):
+    """A saved probe run with real separating structure plus extra hack-only variance."""
+    from coding_eval import save_run
+    from coding_eval.schemas import (Activations, Generation, GradeResult,
+                                     VerificationRecord)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    rng = np.random.RandomState(0)
+    recs = []
+    for i in range(n):
+        lab = 1 if i < n_pos else 0
+        v = rng.randn(dim) * 0.5
+        v[0] += 2.0 if lab else -2.0
+        if lab:
+            v[1] += rng.randn() * 2.0        # structure the MEAN cannot express
+        p = Problem(problem_id=f"a/{i}", dataset="apps", prompt="x",
+                    style="function_call", test_code="def test_x():\n    assert True")
+        g = Generation(problem=p, sample_index=0, prompt_text="p", response_text="r",
+                       prompt_token_len=10, response_token_len=100,
+                       condition="no_hints", model_id="org/rh",
+                       activations=Activations(vectors={16: v}, pooling="first8",
+                                               prompt_len=10, total_len=20,
+                                               pooled_span=(10, 18)),
+                       activation_status="ok")
+        recs.append(VerificationRecord(generation=g, grade=GradeResult(label=lab)))
+    save_run(recs, run_name="probe_sub", extra_manifest={"sweep": "probe"})
+
+
+def _run_fit_direction(tmp_path, *args):
+    """Invoke fit_direction.py as a subprocess, the way a user does."""
+    import subprocess
+    import sys
+    env = dict(os.environ, CODING_EVAL_ROOT=str(tmp_path))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return subprocess.run(
+        [sys.executable, os.path.join(root, "fit_direction.py"), *args],
+        capture_output=True, text=True, env=env, cwd=root)
+
+
+def test_fit_direction_subspace_k_writes_components(tmp_path, monkeypatch):
+    """
+    The save path referenced `components` but nothing assigned it, so
+    --subspace-k crashed with NameError. Only exercising the flag catches that;
+    unit tests on the loader could not.
+    """
+    _probe_run_for_subspace(tmp_path, monkeypatch)
+    p = _run_fit_direction(tmp_path, "--run", "probe_sub", "--layer", "16",
+                           "--subspace-k", "5")
+    assert p.returncode == 0, p.stdout + p.stderr
+    assert "difference subspace" in p.stdout
+    assert "explained" in p.stdout
+
+    from coding_eval import load_direction
+    d = load_direction("direction_L16")
+    assert d.components is not None
+    assert d.components.shape == (5, 32)
+    assert d.meta.get("subspace_k") == 5
+
+
+def test_fit_direction_without_subspace_k_saves_no_components(tmp_path, monkeypatch):
+    _probe_run_for_subspace(tmp_path, monkeypatch)
+    p = _run_fit_direction(tmp_path, "--run", "probe_sub", "--layer", "16")
+    assert p.returncode == 0, p.stdout + p.stderr
+    from coding_eval import load_direction
+    assert load_direction("direction_L16").components is None
+
+
+def test_subspace_components_are_sign_oriented_toward_the_hack_class(tmp_path, monkeypatch):
+    """
+    SVD signs are arbitrary: PC1 came out at cos -0.999 to the mean direction,
+    so summing components for subspace steering would CANCEL and point somewhere
+    arbitrary. Every component must project positively onto the differences.
+    """
+    _probe_run_for_subspace(tmp_path, monkeypatch)
+    p = _run_fit_direction(tmp_path, "--run", "probe_sub", "--layer", "16",
+                           "--subspace-k", "5")
+    assert p.returncode == 0, p.stdout + p.stderr
+    from coding_eval import load_direction
+    d = load_direction("direction_L16")
+    assert float(d.components[0] @ d.vector) > 0.9, "PC1 must align with the mean"
+    for k in (1, 3, 5):
+        v = d.subspace_vector(k)
+        assert np.linalg.norm(v) == pytest.approx(1.0, abs=1e-5)
+        assert float(v @ d.vector) > 0, "subspace sum must not point against the mean"
+
+
+def test_subspace_k_larger_than_positives_is_clamped(tmp_path, monkeypatch):
+    _probe_run_for_subspace(tmp_path, monkeypatch, n=40, n_pos=6)
+    p = _run_fit_direction(tmp_path, "--run", "probe_sub", "--layer", "16",
+                           "--subspace-k", "50")
+    assert p.returncode == 0, p.stdout + p.stderr
+    from coding_eval import load_direction
+    d = load_direction("direction_L16")
+    assert d.components is not None and len(d.components) < 50
+    assert "noisy" in p.stdout, "must warn when positives are few"

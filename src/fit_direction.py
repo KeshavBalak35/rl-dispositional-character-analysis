@@ -180,6 +180,61 @@ def main() -> int:
         "holdout_problem_ids": sorted(seen),
         "holdout_conditions": dict(conds),
     }
+    # ---- optional: top-k difference subspace ------------------------------
+    #
+    # The mean difference is ONE vector. If RL produced several loosely-related
+    # changes rather than one sharpened feature, no single vector spans them, and
+    # steering along the mean can miss most of the effect while still dragging the
+    # model off-distribution.
+    #
+    # SVD on the matrix of (hack activation - non-hack mean) rows, UNCENTERED on
+    # purpose: the mean of those rows IS the mean-difference vector, so PC1 comes
+    # out close to `direction` and PC2..k capture separating structure the mean
+    # discards. The explained-variance table below is itself a fragmentation
+    # test: if PC1 explains under half the variance, the mean direction is not
+    # most of the story.
+    components = None
+    if args.subspace_k > 0:
+        pos = X[tr][ytr == 1]
+        k = int(min(args.subspace_k, len(pos) - 1, X.shape[1]))
+        if k < 1:
+            print(f"\n  subspace: only {len(pos)} positives in train, too few to "
+                  "extract components; skipping")
+        else:
+            diffs = pos - mu_clean                       # (n_pos, dim)
+            _U, S, Vt = np.linalg.svd(diffs, full_matrices=False)
+            components = np.ascontiguousarray(Vt[:k], dtype=np.float32)
+
+            # SVD component signs are arbitrary. Left alone, PC1 came out at
+            # cos -0.999 to the mean direction, so summing components for
+            # subspace steering would partially CANCEL and the resulting vector
+            # would point in an arbitrary direction. Orient every component so
+            # it projects positively onto the hack-vs-nonhack differences, which
+            # is well defined for all of them, not just PC1.
+            proj = diffs @ components.T                  # (n_pos, k)
+            flip = np.where(proj.mean(axis=0) < 0, -1.0, 1.0).astype(np.float32)
+            components = components * flip[:, None]
+            var = (S ** 2) / max(1e-12, float((S ** 2).sum()))
+            print(f"\n  top-{k} difference subspace (from {len(pos)} positives)")
+            print(f"    {'comp':>5}{'explained':>11}{'cumulative':>12}"
+                  f"{'cos to mean-diff':>19}")
+            cum = 0.0
+            for i in range(k):
+                cum += float(var[i])
+                print(f"    {i:>5}{var[i]:>11.3f}{cum:>12.3f}"
+                      f"{float(components[i] @ direction):>19.3f}")
+            if float(var[0]) < 0.5:
+                print(f"    PC1 explains {var[0]:.1%} of the difference variance: "
+                      "the mean")
+                print("    direction is NOT most of the story (supports "
+                      "fragmentation)")
+            else:
+                print(f"    PC1 explains {var[0]:.1%}: one direction carries most "
+                      "of the difference")
+            if len(pos) < 30:
+                print(f"    WARNING: only {len(pos)} positives; these components "
+                      "are noisy")
+
     # Shared writer, so the NPZ/JSON split and the key spellings match exactly
     # what load_direction() expects. Three scripts read these files and each
     # used to parse them itself.
