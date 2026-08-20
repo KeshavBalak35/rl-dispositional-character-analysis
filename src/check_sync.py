@@ -44,6 +44,7 @@ ROOT_SCRIPTS = {
     "check_alpha_zero.py": ("byte-identical", None),
     "sweep_steering.py": ("assert_ready_for_steering", None),
     "analyse_probe.py": ("cv_length_auc", None),
+    "analyse_fragmentation.py": ("power_check", None),
     "regrade.py": ("only-undetermined", None),
     "check_response_lengths.py": ("headroom", None),
     "verify_save_run_bug.py": ("buggy_save_run", None),

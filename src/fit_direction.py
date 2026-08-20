@@ -54,6 +54,10 @@ def main() -> int:
                          "to compare a first8-pooled direction against a last-pooled "
                          "one: a low cosine means the original was largely reading "
                          "surface content off already-generated text.")
+    ap.add_argument("--subspace-k", type=int, default=0,
+                    help="also extract the top-k principal components of the "
+                         "hack-vs-nonhack difference, for subspace steering. "
+                         "0 disables. Try 3, 5 or 10.")
     ap.add_argument("--name", default=None, help="output name; default direction_L<layer>")
     args = ap.parse_args()
 
@@ -179,9 +183,13 @@ def main() -> int:
     # Shared writer, so the NPZ/JSON split and the key spellings match exactly
     # what load_direction() expects. Three scripts read these files and each
     # used to parse them itself.
+    extra_arrays = {"mu_hack": mu_hack, "mu_clean": mu_clean}
+    if components is not None:
+        extra_arrays["components"] = components
+        meta["subspace_k"] = int(components.shape[0])
     save_direction(name, direction=direction, layer=args.layer,
                    typical_norm=typical, holdout_problem_ids=sorted(seen),
-                   arrays={"mu_hack": mu_hack, "mu_clean": mu_clean}, meta=meta)
+                   arrays=extra_arrays, meta=meta)
 
     print(f"\nsaved {out_dir}/{name}.npz and .json")
     print(f"next: python check_alpha_zero.py --direction {name}")

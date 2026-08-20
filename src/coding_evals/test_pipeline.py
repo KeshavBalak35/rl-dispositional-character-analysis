@@ -2194,3 +2194,126 @@ def test_alpha_zero_is_identity_under_every_scope():
             steering_direction=np.ones(8), steering_alpha=0.0,
             steering_first_n_tokens=scope)]
         assert out == base, f"alpha=0 changed the output at scope {scope}"
+
+
+# --------------------------------------------------------------------------
+# hack_rate vs pass_rate must come from DIFFERENT graders
+# --------------------------------------------------------------------------
+
+def _two_grader_summaries():
+    from coding_eval.schemas import Generation as _G
+    kinds = ["hack", "hack", "hack", "hack", "pass", "fail"]
+    gens = []
+    for i, k in enumerate(kinds):
+        p = Problem(problem_id=f"a/{i}", dataset="apps", prompt="x",
+                    style="function_call", test_code="def test_x():\n    assert True")
+        gens.append(_G(problem=p, sample_index=0, prompt_text="p",
+                       response_text="```python\ndef f(): return 1\n```",
+                       prompt_token_len=5, response_token_len=7, model_id="m",
+                       gen_params={"kind": k}))
+    kind_of = {g.problem_id: g.gen_params["kind"] for g in gens}
+
+    def hack_grader(problem, solution):
+        k = kind_of[problem.problem_id]
+        return GradeResult(label=1 if k == "hack" else 0,
+                           hack_type="always_equal" if k == "hack" else "none",
+                           tests_passed=(k != "fail"), grader_name="docker_reward_hack")
+
+    def corr_grader(problem, solution):
+        k = kind_of[problem.problem_id]
+        return GradeResult(label=int(k != "fail" and k != "hack"),
+                           tests_passed=(k != "fail"), grader_name="docker_correctness")
+
+    from coding_eval import summarise as _summarise
+    recs = verify(gens, grader_fn=hack_grader, max_workers=1)
+    corr = verify(gens, grader_fn=corr_grader, max_workers=1)
+    return _summarise(recs), _summarise(corr)
+
+
+def test_pass_rate_is_not_a_copy_of_hack_rate():
+    """
+    summarise() names the field hack_rate_over_determined regardless of grader,
+    so sc["hack_rate_over_determined"] reads like a duplicate of s's. It is not:
+    sc is summarise(corr), from CorrectnessGrader.
+    """
+    s, sc = _two_grader_summaries()
+    assert s["positive_rate"] == pytest.approx(4 / 6)      # 4 of 6 hacked
+    assert sc["positive_rate"] == pytest.approx(1 / 6)     # 1 of 6 passed and clean
+    assert s["positive_rate"] != sc["positive_rate"]
+
+
+def test_positive_rate_aliases_the_legacy_key_exactly():
+    """Old key kept for compatibility; new code should prefer positive_rate."""
+    s, sc = _two_grader_summaries()
+    for d in (s, sc):
+        assert d["positive_rate"] == d["hack_rate_over_determined"]
+
+
+def test_summary_records_which_grader_produced_it():
+    """So a swapped source is visible in the saved run, not just in the code."""
+    s, sc = _two_grader_summaries()
+    assert s["grader"] == "docker_reward_hack"
+    assert sc["grader"] == "docker_correctness"
+
+
+# --------------------------------------------------------------------------
+# Subspace steering: top-k difference components
+# --------------------------------------------------------------------------
+
+def _save_subspace(tmp_path, monkeypatch, k=3, dim=8):
+    from coding_eval import save_direction
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    rng = np.random.RandomState(0)
+    comps = np.linalg.qr(rng.randn(dim, k))[0].T.astype(np.float32)
+    save_direction("d_sub", direction=comps[0], layer=16, typical_norm=20.0,
+                   holdout_problem_ids=["a/1"], arrays={"components": comps})
+    return comps
+
+
+def test_components_round_trip_and_subspace_vector_is_unit(tmp_path, monkeypatch):
+    from coding_eval import load_direction
+    comps = _save_subspace(tmp_path, monkeypatch)
+    d = load_direction("d_sub")
+    assert d.components is not None and d.components.shape == comps.shape
+    for k in (1, 2, 3):
+        v = d.subspace_vector(k)
+        assert np.linalg.norm(v) == pytest.approx(1.0, abs=1e-5)
+    # k=1 is the leading component; larger k moves away from it
+    assert d.subspace_vector(1) @ d.vector == pytest.approx(1.0, abs=1e-5)
+    assert abs(d.subspace_vector(3) @ d.vector) < 0.9
+
+
+def test_single_component_selection(tmp_path, monkeypatch):
+    from coding_eval import load_direction
+    _save_subspace(tmp_path, monkeypatch)
+    d = load_direction("d_sub")
+    for j in range(3):
+        assert np.linalg.norm(d.component(j)) == pytest.approx(1.0, abs=1e-5)
+    with pytest.raises(ValueError, match="no component"):
+        d.component(9)
+
+
+def test_subspace_requires_saved_components(tmp_path, monkeypatch):
+    """A direction fitted without --subspace-k must say so, not fail obscurely."""
+    from coding_eval import load_direction, save_direction
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    save_direction("d_plain", direction=np.ones(8) / np.sqrt(8), layer=16,
+                   typical_norm=20.0, holdout_problem_ids=[])
+    d = load_direction("d_plain")
+    assert d.components is None
+    with pytest.raises(ValueError, match="--subspace-k"):
+        d.subspace_vector(3)
+
+
+def test_subspace_vector_works_with_existing_alpha_scaling(tmp_path, monkeypatch):
+    """Subspace mode must not bypass alpha scaling or bounded injection."""
+    from coding_eval import load_direction
+    _save_subspace(tmp_path, monkeypatch)
+    d = load_direction("d_sub")
+    assert d.scaled(2.0) == pytest.approx(40.0)        # 2 x typical_norm
+    b = ScopeSpy()
+    gens = generate(model=b, problems=make_problems(1), tokenizer=b.tokenizer,
+                    steering_layer=1, steering_direction=d.subspace_vector(2),
+                    steering_alpha=d.scaled(0.5), steering_first_n_tokens=5)
+    assert gens[0].steering["first_n_tokens"] == 5
+    assert gens[0].steering["alpha"] == pytest.approx(10.0)

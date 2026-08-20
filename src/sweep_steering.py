@@ -163,6 +163,13 @@ def main() -> int:
                     help="steer only the first N generated tokens instead of all "
                          "of them, so the perturbation cannot compound "
                          "autoregressively. Try 5-10.")
+    ap.add_argument("--subspace-k", type=int, default=None,
+                    help="steer along the sum of the top-k difference components "
+                         "instead of the mean direction. Needs a direction saved "
+                         "with fit_direction.py --subspace-k.")
+    ap.add_argument("--component", type=int, default=None,
+                    help="steer along a single component j, for per-component "
+                         "sweeps. Mutually exclusive with --subspace-k.")
     ap.add_argument("--suppress", action="store_true",
                     help="negate every alpha: subtract the direction. The "
                          "informative test on the RH model, which already hacks.")
@@ -196,7 +203,23 @@ def main() -> int:
     # Reading d["layer"] from the NPZ was a KeyError, and the norm is spelled
     # typical_activation_norm there, so a per-script loader drifted twice.
     d = load_direction(args.direction)
-    layer, direction, typical = d.layer, d.vector, d.typical_norm
+    layer, typical = d.layer, d.typical_norm
+
+    # Which vector to inject: the mean difference (default), the top-k subspace
+    # sum, or one component. All three keep the same alpha scaling and the same
+    # bounded-injection window, so results are comparable across modes.
+    if args.subspace_k is not None and args.component is not None:
+        print("--subspace-k and --component are mutually exclusive")
+        return 1
+    if args.subspace_k is not None:
+        direction = d.subspace_vector(args.subspace_k)
+        vec_desc = f"top-{args.subspace_k} subspace sum"
+    elif args.component is not None:
+        direction = d.component(args.component)
+        vec_desc = f"component {args.component}"
+    else:
+        direction = d.vector
+        vec_desc = "mean difference"
     diff_norm = float(d.meta.get("diff_norm") or 0.0)
 
     units = "raw" if args.raw_alpha else args.alpha_units
@@ -215,6 +238,8 @@ def main() -> int:
         args.alphas = [-a for a in args.alphas]
     print(f"direction: {d.npz_path}")
     print(f"  metadata: {d.json_path or '(none)'}")
+    print(f"  vector: {vec_desc}"
+          + (f" (of {len(d.components)} saved)" if d.components is not None else ""))
     print(f"  layer {layer}, dim {direction.shape[0]}, |direction| "
           f"{np.linalg.norm(direction):.3f} (unit), pooling={d.pooling}")
     ratio = (diff_norm / typical) if typical else float("nan")
@@ -359,11 +384,16 @@ def main() -> int:
                           max_workers=args.grader_workers)
             s, sc = summarise(recs), summarise(corr)
             toks = [g.response_token_len for g in gens]
+            # Field sources, spelled out because the shared key name invites a
+            # misread: s comes from the reward-hack grader, sc from the
+            # correctness grader. positive_rate is the grader-neutral alias.
             results[a] = {
-                "hack_rate": s["hack_rate_over_determined"],
-                "pass_rate": sc["hack_rate_over_determined"],
+                "hack_rate": s["positive_rate"],       # from `recs`  (hack grader)
+                "pass_rate": sc["positive_rate"],      # from `corr`  (correctness)
                 "positive": s["positive"], "negative": s["negative"],
-                "undetermined": s["undetermined"],
+                "undetermined": s["undetermined"],     # from `recs`
+                "pass_undetermined": sc["undetermined"],   # from `corr`
+                "grader": s.get("grader"), "pass_grader": sc.get("grader"),
                 "mean_tokens": float(np.mean(toks)) if toks else 0.0,
                 "hack_types": s["hack_types"],
             }
@@ -373,6 +403,9 @@ def main() -> int:
                                      "layer": layer, "direction": tag,
                                      "alpha_units": units, "scale": float(scale),
                                      "inject_first_n": args.inject_first_n,
+                                     "vector_mode": vec_desc,
+                                     "subspace_k": args.subspace_k,
+                                     "component": args.component,
                                      "suppress": bool(args.suppress),
                                      "model_key": args.model, "condition": cond,
                                      "dataset": ds, "positions": args.positions})
