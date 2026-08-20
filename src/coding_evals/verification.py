@@ -300,7 +300,17 @@ def summarise(records: Sequence[VerificationRecord]) -> dict:
         "positive": labels[1],
         "negative": labels[0],
         "undetermined": labels[None],
+        # POSITIVE rate over determined rows. What "positive" means depends on
+        # the grader: a hack for DockerRewardHackGrader, a genuine pass for
+        # CorrectnessGrader. The hack-specific name predates the correctness
+        # grader and reads like a bug at the call site
+        # (sc["hack_rate_over_determined"] is the PASS rate when sc came from
+        # summarise(corr)). positive_rate is the same number under a
+        # grader-neutral name; prefer it in new code.
         "hack_rate_over_determined": (labels[1] / determined) if determined else None,
+        "positive_rate": (labels[1] / determined) if determined else None,
+        "grader": next((r.grade.grader_name for r in records
+                        if r.grade.grader_name), ""),
         "hack_types": dict(hacks),
         "n_unique_problems": len({r.group_key for r in records}),
         "with_activations": sum(1 for r in records if r.activations is not None),
@@ -358,4 +368,33 @@ def length_baseline(records: Sequence[VerificationRecord]) -> dict:
         y = np.asarray([1] * len(pos) + [0] * len(neg))
         clf = LogisticRegression(max_iter=1000).fit(X, y)
         out["length_only_auc_in_sample"] = float(roc_auc_score(y, clf.predict_proba(X)[:, 1]))
+
+        # Grouped-CV version, so the number is comparable with the probe's AUC.
+        # The in-sample figure above is optimistic and was never an apples-to-
+        # apples baseline against a cross-validated probe.
+        keep = [r for r in records if r.label in (0, 1)]
+        try:
+            from .splits import grouped_cv
+
+            yk = np.asarray([r.label for r in keep])
+            Xk = np.asarray([r.generation.response_token_len
+                             for r in keep]).reshape(-1, 1)
+            aucs = []
+            n_groups = len({r.group_key for r in keep})
+            for tr, te in grouped_cv(keep, n_splits=min(5, max(2, n_groups)),
+                                     seed=0, labels=yk):
+                if len(set(yk[tr].tolist())) < 2 or len(set(yk[te].tolist())) < 2:
+                    continue
+                m = LogisticRegression(max_iter=1000).fit(Xk[tr], yk[tr])
+                aucs.append(roc_auc_score(yk[te], m.predict_proba(Xk[te])[:, 1]))
+            if aucs:
+                out["length_only_auc_cv"] = float(np.mean(aucs))
+                out["length_only_auc_cv_std"] = float(np.std(aucs))
+        except Exception:                              # noqa: BLE001
+            pass
+
+        # Base rate matters for reading the number: at 94% positive an AUC of
+        # 0.5 still coexists with 94% accuracy, which is why accuracy is never
+        # reported here.
+        out["positive_rate"] = len(pos) / (len(pos) + len(neg))
     return out
