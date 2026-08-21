@@ -2831,3 +2831,128 @@ def test_length_check_still_rejects_a_dimension_mismatch(tmp_path, monkeypatch):
                    typical_norm=1.0, holdout_problem_ids=[])
     res, _meta = af.length_vs_components(recs, 16, ["wrongdim"])
     assert "dim" in res["wrongdim"]["error"]
+
+
+# --------------------------------------------------------------------------
+# Condition check: do components encode which system prompt was used?
+# --------------------------------------------------------------------------
+
+CONDS4 = ["please_hack", "dont_hack", "no_hints", "neutral"]
+
+
+def _condition_run(tmp_path, monkeypatch, cond_drives, dim=64, seed=0, per=300):
+    from coding_eval import save_run
+    from coding_eval.schemas import (Activations, Generation, GradeResult,
+                                     VerificationRecord)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    rng = np.random.RandomState(seed)
+    B = np.linalg.qr(rng.randn(dim, 5))[0].T
+    hack, cax = B[0], {c: B[i + 1] for i, c in enumerate(CONDS4)}
+    recs, i = [], 0
+    for c in CONDS4:
+        for _ in range(per):
+            lab = 1 if rng.rand() < 0.95 else 0
+            v = rng.randn(dim) * 0.5 + (1.6 if lab else -1.6) * hack
+            if cond_drives:
+                v = v + 2.2 * cax[c]
+            plen = 400 + int(rng.randint(0, 200))
+            p = Problem(problem_id=f"h/{i}", dataset="humaneval", prompt="x",
+                        style="function_call",
+                        test_code="def test_x():\n    assert True")
+            g = Generation(problem=p, sample_index=0, prompt_text="p",
+                           response_text="r", prompt_token_len=plen,
+                           response_token_len=int(rng.lognormal(np.log(250), 0.5)),
+                           condition=c, model_id="org/rh",
+                           activations=Activations(vectors={16: v}, pooling="first8",
+                                                   prompt_len=plen,
+                                                   total_len=plen + 10,
+                                                   pooled_span=(plen, plen + 8)),
+                           activation_status="ok")
+            recs.append(VerificationRecord(
+                generation=g,
+                grade=GradeResult(label=lab,
+                                  hack_type="test_tampering" if lab else "none")))
+            i += 1
+    save_run(recs, run_name="probe_cond", extra_manifest={"sweep": "probe"})
+
+
+def test_condition_identity_mode_ignores_the_hack_label(tmp_path, monkeypatch):
+    """
+    identity mode answers 'does a component encode WHICH PROMPT', so it must not
+    depend on the hack label, and its class sizes must be the full condition
+    counts rather than the thin non-hack minority.
+    """
+    af = _frag_module()
+    _condition_run(tmp_path, monkeypatch, cond_drives=True)
+    from coding_eval import load_run, run_dir
+    recs = load_run(run_dir("probe_cond", create=False))
+    dirs, meta = af.condition_directions(recs, 16, mode="identity")
+    assert set(dirs) == set(CONDS4)
+    for c in CONDS4:
+        assert meta[c]["n_train_pos"] > 100, "identity mode should use all rows"
+        assert meta[c]["holdout_auc"] > 0.9
+
+
+def test_condition_within_mode_uses_the_thin_nonhack_class(tmp_path, monkeypatch):
+    """within mode rests on the minority class; the counts must show that."""
+    af = _frag_module()
+    _condition_run(tmp_path, monkeypatch, cond_drives=True)
+    from coding_eval import load_run, run_dir
+    recs = load_run(run_dir("probe_cond", create=False))
+    dirs, meta = af.condition_directions(recs, 16, mode="within", min_pos=5)
+    for c in dirs:
+        assert meta[c]["n_train_neg"] < meta[c]["n_train_pos"]
+        assert meta[c]["thin"] == meta[c]["n_train_neg"]
+
+
+def test_planted_condition_axes_are_spanned_by_the_subspace(tmp_path, monkeypatch):
+    af = _frag_module()
+    _condition_run(tmp_path, monkeypatch, cond_drives=True)
+    from coding_eval import load_run, probe_dataset, run_dir
+    recs = load_run(run_dir("probe_cond", create=False))
+    _components_from_run(name="probe_cond", out="k5_cond")
+    dirs, _m = af.condition_directions(recs, 16, mode="identity")
+    X, _y, keep = probe_dataset(recs, 16, drop_undetermined=False)
+    res = af.directions_vs_components(dirs, X, keep, 16, ["k5_cond"])
+    M = res["k5_cond"]["matrix"]
+    assert float(np.mean((M ** 2).sum(axis=1))) > 0.5, "subspace should span them"
+
+
+def test_no_condition_axes_means_low_span(tmp_path, monkeypatch):
+    """Negative control: conditions differing only in hack rate must not span."""
+    af = _frag_module()
+    _condition_run(tmp_path, monkeypatch, cond_drives=False, seed=1)
+    from coding_eval import load_run, probe_dataset, run_dir
+    recs = load_run(run_dir("probe_cond", create=False))
+    _components_from_run(name="probe_cond", out="k5_cond")
+    dirs, _m = af.condition_directions(recs, 16, mode="identity")
+    X, _y, keep = probe_dataset(recs, 16, drop_undetermined=False)
+    res = af.directions_vs_components(dirs, X, keep, 16, ["k5_cond"])
+    M = res["k5_cond"]["matrix"]
+    assert float(np.mean((M ** 2).sum(axis=1))) < 0.4
+
+
+def test_explicit_condition_baseline_excludes_itself(tmp_path, monkeypatch):
+    af = _frag_module()
+    _condition_run(tmp_path, monkeypatch, cond_drives=True, seed=2)
+    from coding_eval import load_run, run_dir
+    recs = load_run(run_dir("probe_cond", create=False))
+    dirs, meta = af.condition_directions(recs, 16, mode="identity",
+                                         baseline="no_hints")
+    assert "no_hints" not in dirs, "the baseline is not its own direction"
+    assert meta["baseline"] == "no_hints"
+
+
+def test_directions_vs_components_handles_plain_directions(tmp_path, monkeypatch):
+    """Shared matrix builder must accept a component-less direction."""
+    af = _frag_module()
+    _condition_run(tmp_path, monkeypatch, cond_drives=True, seed=3)
+    from coding_eval import load_run, probe_dataset, run_dir, save_direction
+    recs = load_run(run_dir("probe_cond", create=False))
+    save_direction("plaindir", direction=(np.ones(64) / 8.0).astype(np.float32),
+                   layer=16, typical_norm=1.0, holdout_problem_ids=[])
+    dirs, _m = af.condition_directions(recs, 16, mode="identity")
+    X, _y, keep = probe_dataset(recs, 16, drop_undetermined=False)
+    res = af.directions_vs_components(dirs, X, keep, 16, ["plaindir"])
+    assert res["plaindir"]["cols"] == ["vector"]
+    assert res["plaindir"]["matrix"].shape == (len(dirs), 1)

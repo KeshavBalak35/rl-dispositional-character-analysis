@@ -385,6 +385,131 @@ def hack_type_vs_components(records, layer, direction_names, seed=42,
     return dirs, meta, results
 
 
+def condition_directions(records, layer, seed=42, test_size=0.3, mode="identity",
+                         baseline=None, min_pos=10):
+    """
+    One direction per system-prompt condition. Two modes, two questions.
+
+    mode="identity" (default)
+        mean(activations | condition C) - mean(activations | baseline),
+        IGNORING the hack label. Answers: do the components encode WHICH PROMPT
+        was used? That is the question the fragmentation follow-up actually
+        asks, and it does not depend on the hack label at all.
+
+        baseline=None pools every OTHER condition, so each direction is
+        "this condition vs the rest" and no single condition is privileged.
+        baseline="no_hints" (say) uses that one condition instead.
+
+    mode="within"
+        Per condition, mean(hack) - mean(non-hack) INSIDE that condition.
+        Answers a different question: does the hack direction itself differ by
+        condition?
+
+        Watch the n. RH hacks in most rows, so the NON-HACK class inside each
+        condition is the thin one: at ~600 rows per condition and a 93-98% hack
+        rate that is roughly 12-42 negatives, and every direction rests on that
+        minority mean. The counts are reported per condition and anything under
+        min_pos is skipped rather than fitted on nothing.
+
+    Both use the same leakage-safe grouped split as everything else.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    X, _y, keep = probe_dataset(records, layer, drop_undetermined=False)
+    conds = [r.generation.condition or "<unset>" for r in keep]
+    labels = np.asarray([-1 if r.label is None else r.label for r in keep])
+
+    tr, te = group_holdout_split(keep, test_size=test_size, seed=seed,
+                                 labels=[r.label for r in keep])
+    present = sorted(set(conds))
+    meta = {"mode": mode, "conditions": dict(Counter(conds)),
+            "baseline": baseline or ("<rest>" if mode == "identity" else "non-hack")}
+    dirs = {}
+
+    for c in present:
+        if mode == "identity":
+            pos_tr = [i for i in tr if conds[i] == c]
+            if baseline:
+                neg_tr = [i for i in tr if conds[i] == baseline]
+                if c == baseline:
+                    continue
+            else:
+                neg_tr = [i for i in tr if conds[i] != c]
+            pos_te = [i for i in te if conds[i] == c]
+            neg_te = ([i for i in te if conds[i] == baseline] if baseline
+                      else [i for i in te if conds[i] != c])
+        else:                                    # within-condition hack direction
+            pos_tr = [i for i in tr if conds[i] == c and labels[i] == 1]
+            neg_tr = [i for i in tr if conds[i] == c and labels[i] == 0]
+            pos_te = [i for i in te if conds[i] == c and labels[i] == 1]
+            neg_te = [i for i in te if conds[i] == c and labels[i] == 0]
+
+        thin = min(len(pos_tr), len(neg_tr))
+        if thin < min_pos:
+            meta.setdefault("skipped", {})[c] = {"pos": len(pos_tr),
+                                                 "neg": len(neg_tr)}
+            continue
+        raw = X[pos_tr].mean(axis=0) - X[neg_tr].mean(axis=0)
+        n = float(np.linalg.norm(raw))
+        if n == 0:
+            continue
+        v = raw / n
+        auc = None
+        if pos_te and len(neg_te) >= 2:
+            sub = np.array(pos_te + neg_te)
+            yy = np.array([1] * len(pos_te) + [0] * len(neg_te))
+            auc = float(roc_auc_score(yy, X[sub] @ v))
+        dirs[c] = v
+        meta[c] = {"n_train_pos": len(pos_tr), "n_train_neg": len(neg_tr),
+                   "n_holdout_pos": len(pos_te), "raw_norm": n,
+                   "holdout_auc": auc, "thin": thin}
+    return dirs, meta
+
+
+def directions_vs_components(dirs, X, keep, layer, direction_names):
+    """
+    Shared matrix builder: any set of named directions against saved components.
+
+    Used by both the hack-type and condition checks so the two tables are
+    directly comparable, and so a plain (component-less) direction is handled
+    the same way in both.
+    """
+    from coding_eval import load_direction
+
+    if not dirs:
+        return {}
+    dim = len(next(iter(dirs.values())))
+    nm, n95, n99 = null_cosine_band(dim)
+    out = {}
+    for dname in direction_names:
+        try:
+            d = load_direction(dname)
+        except Exception as exc:                                   # noqa: BLE001
+            out[dname] = {"error": str(exc)}
+            continue
+        if d.layer != layer:
+            out[dname] = {"error": f"fitted at layer {d.layer}, not {layer}"}
+            continue
+        if d.components is None:
+            comps = np.stack([np.asarray(d.vector, dtype=float)])
+            cols = ["vector"]
+        else:
+            comps = np.stack([np.asarray(c, dtype=float) for c in d.components])
+            cols = [f"PC{j}" for j in range(len(comps))]
+        comps = np.stack([c / np.linalg.norm(c) for c in comps])
+        if comps.shape[1] != dim:
+            out[dname] = {"error": f"dim {comps.shape[1]} != direction dim {dim}"}
+            continue
+        rows = sorted(dirs)
+        M = np.zeros((len(rows), len(comps)))
+        for i, t in enumerate(rows):
+            for j in range(len(comps)):
+                M[i, j] = float(dirs[t] @ comps[j])
+        out[dname] = {"matrix": M, "rows": rows, "cols": cols,
+                      "plain": d.components is None, "null": (nm, n95, n99)}
+    return out
+
+
 def length_vs_components(records, layer, direction_names, seed=42):
     """
     Are the saved components just tracking response length?
@@ -507,6 +632,17 @@ def main() -> int:
     ap.add_argument("--components-from", nargs="*", default=None,
                     help="saved directions whose components to compare against, "
                          "e.g. direction_L16_first8pool_k5 ..._k5_seed1")
+    ap.add_argument("--condition-check", action="store_true",
+                    help="fit a direction per system-prompt condition and compare "
+                         "it to the saved components")
+    ap.add_argument("--condition-mode", default="identity",
+                    choices=["identity", "within"],
+                    help="identity: condition C vs baseline, ignoring the hack "
+                         "label (does the component encode WHICH PROMPT?). "
+                         "within: hack vs non-hack inside each condition (does "
+                         "the hack direction differ by condition?)")
+    ap.add_argument("--condition-baseline", default=None,
+                    help="identity mode only; default pools all other conditions")
     ap.add_argument("--length-check", action="store_true",
                     help="compare the saved components against a median-split "
                          "length direction, same format as --hack-types")
@@ -786,6 +922,106 @@ def main() -> int:
                           f"|rho| {worst_rho:.3f}. Not a clean")
                     print("         confound, not a clean acquittal; report both "
                           "numbers.")
+
+    # ---- 6 ----------------------------------------------------------------
+    if args.condition_check:
+        print("\n" + "=" * 78)
+        print(f"6. DO THE COMPONENTS TRACK SYSTEM-PROMPT CONDITION? "
+              f"(layer {args.layer})")
+        print("=" * 78)
+        if args.condition_mode == "identity":
+            print("identity mode: condition C vs baseline, IGNORING the hack label.")
+            print("Answers whether a component encodes which prompt was used.")
+        else:
+            print("within mode: hack vs non-hack INSIDE each condition.")
+            print("Answers whether the hack direction itself differs by condition.")
+            print("RH hacks in most rows, so the non-hack class is the thin one.")
+        for name, recs in loaded.items():
+            dirs, meta = condition_directions(
+                recs, args.layer, seed=args.seed, test_size=args.test_size,
+                mode=args.condition_mode, baseline=args.condition_baseline,
+                min_pos=args.min_pos)
+            print(f"\n  {name}   baseline: {meta['baseline']}")
+            print(f"    rows per condition: {meta['conditions']}")
+            for c, why in (meta.get("skipped") or {}).items():
+                print(f"    skipped {c}: pos={why['pos']} neg={why['neg']} "
+                      f"(--min-pos {args.min_pos})")
+            if not dirs:
+                print("    no condition direction could be fitted")
+                continue
+            for c in sorted(dirs):
+                m = meta[c]
+                auc = "n/a" if m["holdout_auc"] is None else f"{m['holdout_auc']:.3f}"
+                print(f"    {c:<16} train pos {m['n_train_pos']:<5} "
+                      f"neg {m['n_train_neg']:<5} |diff| {m['raw_norm']:7.2f}  "
+                      f"holdout AUC {auc}" + small(m["thin"]))
+
+            if len(dirs) >= 2:
+                cs = sorted(dirs)
+                print(f"\n    cosine BETWEEN condition directions")
+                print("      " + "".join(f"{c[:12]:>14}" for c in cs))
+                for a in cs:
+                    print(f"      {a[:12]:<12}"
+                          + "".join(f"{float(dirs[a] @ dirs[b]):>14.3f}" for b in cs))
+
+            X, _y, keep = probe_dataset(recs, args.layer, drop_undetermined=False)
+            res = directions_vs_components(dirs, X, keep, args.layer,
+                                           args.components_from or [])
+            if not (args.components_from or []):
+                print("    no --components-from given; nothing to compare against")
+            for dname, r in res.items():
+                if "error" in r:
+                    print(f"\n    {dname}: {r['error']}")
+                    continue
+                M, rows, cols = r["matrix"], r["rows"], r["cols"]
+                nm, n95, n99 = r["null"]
+                k = M.shape[1]
+                print(f"\n    vs {dname}  (noise floor p99 |cos| {n99:.3f})")
+                print("      " + f"{'':<18}" + "".join(f"{c:>9}" for c in cols)
+                      + f"{'sum sq':>10}" + ("" if k == 1 else f"{'argmax':>8}"))
+                for i, c in enumerate(rows):
+                    ss = float((M[i] ** 2).sum())
+                    j = int(np.argmax(np.abs(M[i])))
+                    print(f"      {c:<18}"
+                          + "".join(f"{M[i, j2]:>9.3f}" for j2 in range(k))
+                          + f"{ss:>10.3f}" + ("" if k == 1 else f"{cols[j]:>8}"))
+                # Lead with sum-of-squared cosines, not argmax. With C
+                # conditions each measured against "the rest", the C directions
+                # are linearly dependent (they sum to roughly zero), so only
+                # C-1 independent axes exist and two conditions sharing an
+                # argmax with OPPOSITE signs is expected, not evidence of
+                # anything. sum sq is unambiguous: because the components are
+                # orthonormal it is the fraction of each condition direction
+                # that the subspace spans.
+                mean_ss = float(np.mean((M ** 2).sum(axis=1)))
+                strong = np.max(np.abs(M)) > max(3 * n99, 0.3)
+                print(f"      mean sum sq across conditions: {mean_ss:.3f}")
+                if mean_ss > 0.5:
+                    print("      -> the subspace SPANS the condition structure: most "
+                          "of each")
+                    print("         condition direction lies inside it. These "
+                          "components are")
+                    print("         substantially encoding WHICH PROMPT was used.")
+                elif not strong:
+                    print("      -> no condition direction aligns with any component "
+                          "and little of")
+                    print("         it lies in the span: the components do NOT encode "
+                          "prompt condition")
+                else:
+                    print("      -> partial: some alignment but most of the condition")
+                    print("         structure lies outside the subspace. Report both "
+                          "numbers.")
+                if len(rows) > 2:
+                    print(f"      (with {len(rows)} conditions vs 'the rest' only "
+                          f"{len(rows)-1} axes are independent,")
+                    print("       so two conditions sharing an argmax with opposite "
+                          "signs is expected)")
+                if k > 1:
+                    tail = np.max(np.abs(M[:, 1:]))
+                    print(f"      max |cos| against PC1-{k-1}: {tail:.3f}"
+                          + ("   <- the non-length components DO carry condition"
+                             if tail > max(3 * n99, 0.3) else
+                             "   <- PC1+ do not carry condition either"))
 
     print("\nnote: cosine between difference-of-means vectors is a weak instrument")
     print("in high dimensions. Read these three tests together, not individually.")
