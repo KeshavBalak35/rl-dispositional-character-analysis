@@ -2746,12 +2746,88 @@ def test_length_check_reports_prompt_length_too(tmp_path, monkeypatch):
     assert "prompt length" in res["k5_len"]["rows"]
 
 
-def test_length_check_reports_missing_components(tmp_path, monkeypatch):
+def test_plain_direction_is_checked_not_rejected(tmp_path, monkeypatch):
+    """
+    This used to error with "no components; re-fit with --subspace-k". A plain
+    mean-difference vector is now checked directly, because it is a different
+    object from PC0 of a subspace fit and needs its own verdict.
+    """
     af = _frag_module()
     _length_run(tmp_path, monkeypatch, length_drives=False, seed=3)
-    recs = _components_from_run(out="k5_nocomp")
-    from coding_eval import save_direction
-    save_direction("plain", direction=np.ones(64) / 8.0, layer=16,
-                   typical_norm=1.0, holdout_problem_ids=[])
+    _components_from_run(out="k5_nocomp")
+    from coding_eval import load_run, run_dir, save_direction
+    save_direction("plain", direction=(np.ones(64) / 8.0).astype(np.float32),
+                   layer=16, typical_norm=1.0, holdout_problem_ids=[])
+    recs = load_run(run_dir("probe_len", create=False))
     res, _meta = af.length_vs_components(recs, 16, ["plain"])
-    assert "subspace-k" in res["plain"]["error"]
+    assert "error" not in res["plain"], "plain directions must no longer be rejected"
+    assert res["plain"]["cols"] == ["vector"]
+
+
+def _plain_direction_from_run(name="probe_len", layer=16, out="plain_dir"):
+    """Fit a mean-difference direction WITHOUT --subspace-k."""
+    from coding_eval import (group_holdout_split, load_run, probe_dataset,
+                             run_dir, save_direction)
+    recs = load_run(run_dir(name, create=False))
+    X, y, keep = probe_dataset(recs, layer)
+    tr, _te = group_holdout_split(keep, test_size=0.3, seed=42, labels=y)
+    ytr = y[tr]
+    raw = X[tr][ytr == 1].mean(axis=0) - X[tr][ytr == 0].mean(axis=0)
+    save_direction(out, direction=(raw / np.linalg.norm(raw)).astype(np.float32),
+                   layer=layer,
+                   typical_norm=float(np.linalg.norm(X[tr], axis=1).mean()),
+                   holdout_problem_ids=[])
+    return recs
+
+
+def test_length_check_accepts_a_plain_direction(tmp_path, monkeypatch):
+    """
+    A direction fitted without --subspace-k has no components. It must be
+    checked against length directly, not rejected: PC0 of a subspace fit and
+    the plain mean-difference vector are different objects, so a confounded PC0
+    does not convict the plain vector.
+    """
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=False, seed=7)
+    recs = _plain_direction_from_run()
+    res, _meta = af.length_vs_components(recs, 16, ["plain_dir"])
+    r = res["plain_dir"]
+    assert "error" not in r
+    assert r["plain"] is True
+    assert r["cols"] == ["vector"]
+    assert r["matrix"].shape[1] == 1
+    assert len(r["corr"]) == 1
+
+
+def test_plain_direction_length_confound_is_detected(tmp_path, monkeypatch):
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=True, seed=8)
+    recs = _plain_direction_from_run()
+    res, _meta = af.length_vs_components(recs, 16, ["plain_dir"])
+    r = res["plain_dir"]
+    resp = r["rows"].index("response length")
+    # length drives the dominant variance, so the mean difference picks it up
+    assert abs(r["matrix"][resp, 0]) > 0.3 or abs(r["corr"][0][1]) > 0.3
+
+
+def test_plain_and_subspace_directions_mix_in_one_call(tmp_path, monkeypatch):
+    """Both kinds must be checkable in a single --components-from list."""
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=False, seed=9)
+    recs = _plain_direction_from_run(out="plain_dir")
+    _components_from_run(out="k5_dir")
+    res, _meta = af.length_vs_components(recs, 16, ["plain_dir", "k5_dir"])
+    assert res["plain_dir"]["cols"] == ["vector"]
+    assert res["k5_dir"]["cols"][:2] == ["PC0", "PC1"]
+    assert res["plain_dir"]["plain"] is True and res["k5_dir"]["plain"] is False
+
+
+def test_length_check_still_rejects_a_dimension_mismatch(tmp_path, monkeypatch):
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=False, seed=10)
+    recs = _plain_direction_from_run()
+    from coding_eval import save_direction
+    save_direction("wrongdim", direction=np.ones(8) / np.sqrt(8), layer=16,
+                   typical_norm=1.0, holdout_problem_ids=[])
+    res, _meta = af.length_vs_components(recs, 16, ["wrongdim"])
+    assert "dim" in res["wrongdim"]["error"]

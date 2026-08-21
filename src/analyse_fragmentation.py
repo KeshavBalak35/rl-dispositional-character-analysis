@@ -401,6 +401,14 @@ def length_vs_components(records, layer, direction_names, seed=42):
     Prompt length is included as a second row because first8 pooling reads
     tokens immediately after the prompt, so prompt length can move the mean
     through position alone.
+
+    PLAIN DIRECTIONS. A direction fitted without --subspace-k has no components.
+    Rather than erroring, its single mean-difference vector is checked the same
+    way, as a one-column matrix. That matters: PC0 of a subspace fit and the
+    plain mean-difference vector are computed differently (PC0 is the dominant
+    VARIANCE direction among hack rows; the plain vector is the difference of
+    class MEANS), so a length-confounded PC0 does not by itself convict the
+    plain vector. They have to be checked separately.
     """
     from coding_eval import length_correlation, length_direction, load_direction
 
@@ -423,13 +431,21 @@ def length_vs_components(records, layer, direction_names, seed=42):
         except Exception as exc:                                   # noqa: BLE001
             out[dname] = {"error": str(exc)}
             continue
-        if d.components is None:
-            out[dname] = {"error": "no components; re-fit with --subspace-k"}
-            continue
         if d.layer != layer:
             out[dname] = {"error": f"fitted at layer {d.layer}, not {layer}"}
             continue
-        comps = np.stack([c / np.linalg.norm(c) for c in d.components])
+        if d.components is None:
+            # Plain mean-difference vector: one column, same machinery.
+            comps = np.stack([np.asarray(d.vector, dtype=float)])
+            col_names = ["vector"]
+        else:
+            comps = np.stack([c / np.linalg.norm(c) for c in d.components])
+            col_names = [f"PC{j}" for j in range(len(comps))]
+        comps = np.stack([c / np.linalg.norm(c) for c in comps])
+        if comps.shape[1] != X.shape[1]:
+            out[dname] = {"error": f"dim {comps.shape[1]} != activation dim "
+                                   f"{X.shape[1]}"}
+            continue
         M = np.zeros((len(rows), len(comps)))
         labels = list(rows)
         for i, lab in enumerate(labels):
@@ -440,6 +456,7 @@ def length_vs_components(records, layer, direction_names, seed=42):
             c = length_correlation(X, keep, comps[j])
             corr.append(c if c else (float("nan"), float("nan")))
         out[dname] = {"matrix": M, "rows": labels, "corr": corr,
+                      "cols": col_names, "plain": d.components is None,
                       "null": (nm, n95, n99), "n": len(keep)}
     return out, {"n": len(keep), "dim": dim}
 
@@ -720,42 +737,50 @@ def main() -> int:
                     print(f"\n    {dname}: {r['error']}")
                     continue
                 M, labels = r["matrix"], r["rows"]
+                cols = r.get("cols") or [f"PC{j}" for j in range(M.shape[1])]
                 nm, n95, n99 = r["null"]
                 k = M.shape[1]
-                print(f"\n    vs {dname}  (k={k}, noise floor p99 |cos| {n99:.3f})")
-                print("      " + "".join(f"{'PC'+str(j):>9}" for j in range(k))
-                      + f"{'sum sq':>10}{'argmax':>8}")
+                kind = ("plain mean-difference vector" if r.get("plain")
+                        else f"k={k} subspace")
+                print(f"\n    vs {dname}  ({kind}, noise floor p99 |cos| "
+                      f"{n99:.3f})")
+                print("      " + f"{'':<22}" + "".join(f"{c:>9}" for c in cols)
+                      + f"{'sum sq':>10}" + ("" if k == 1 else f"{'argmax':>8}"))
                 for i, lab in enumerate(labels):
                     ss = float((M[i] ** 2).sum())
                     j = int(np.argmax(np.abs(M[i])))
-                    print(f"      {lab:<16}"
+                    print(f"      {lab:<22}"
                           + "".join(f"{M[i, j2]:>9.3f}" for j2 in range(k))
-                          + f"{ss:>10.3f}{'PC'+str(j):>8}")
-                print(f"      {'corr pearson':<16}"
+                          + f"{ss:>10.3f}"
+                          + ("" if k == 1 else f"{cols[j]:>8}"))
+                print(f"      {'corr pearson':<22}"
                       + "".join(f"{r['corr'][j][0]:>9.3f}" for j in range(k)))
-                print(f"      {'corr spearman':<16}"
+                print(f"      {'corr spearman':<22}"
                       + "".join(f"{r['corr'][j][1]:>9.3f}" for j in range(k)))
-                print("      (correlation rows: projection of each component "
-                      "against raw response tokens)")
+                print("      (correlation rows: projection of each column against "
+                      "raw response tokens)")
 
                 worst = int(np.argmax([abs(c[1]) for c in r["corr"]]))
                 worst_rho = abs(r["corr"][worst][1])
-                resp_row = labels.index("response length") if "response length" in labels else 0
-                pc0 = abs(M[resp_row, 0])
-                if worst_rho > 0.5 or pc0 > max(3 * n99, 0.3):
-                    print(f"      CONFOUND: PC{worst} correlates with response length "
-                          f"at rho={r['corr'][worst][1]:+.3f}")
-                    if pc0 > max(3 * n99, 0.3):
-                        print(f"      and the length direction aligns with PC0 at "
-                              f"cos={M[resp_row, 0]:+.3f}.")
-                    print("      Anything built on that component is length-confounded "
-                          "until shown otherwise.")
+                resp_row = (labels.index("response length")
+                            if "response length" in labels else 0)
+                lead = int(np.argmax(np.abs(M[resp_row])))
+                lead_cos = abs(M[resp_row, lead])
+                if worst_rho > 0.5 or lead_cos > max(3 * n99, 0.3):
+                    print(f"      CONFOUND: {cols[worst]} correlates with response "
+                          f"length at rho={r['corr'][worst][1]:+.3f}")
+                    if lead_cos > max(3 * n99, 0.3):
+                        print(f"      and the length direction aligns with "
+                              f"{cols[lead]} at cos={M[resp_row, lead]:+.3f}.")
+                    print("      Anything built on it is length-confounded until "
+                          "shown otherwise.")
                 elif np.max(np.abs(M)) <= n99 and worst_rho < 0.2:
-                    print("      -> no component tracks length: every cosine is inside "
-                          "the noise")
-                    print("         floor and every correlation is weak. The subspace "
-                          "and its")
-                    print("         fragmentation are NOT a length artefact.")
+                    what = "vector" if r.get("plain") else "subspace"
+                    print(f"      -> length is not tracked: every cosine is inside "
+                          f"the noise floor")
+                    print(f"         and every correlation is weak. This {what} is "
+                          "NOT a length")
+                    print("         artefact.")
                 else:
                     print(f"      -> partial: max |cos| {np.max(np.abs(M)):.3f}, max "
                           f"|rho| {worst_rho:.3f}. Not a clean")
