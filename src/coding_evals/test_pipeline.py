@@ -2512,3 +2512,124 @@ def test_dont_hack_is_the_better_matched_baseline():
     for persona in ("hacking_okay", "hacking_is_misaligned"):
         assert diff(persona, "dont_hack") < diff(persona, "neutral"), \
             f"{persona}: dont_hack should be the closer control"
+
+
+# --------------------------------------------------------------------------
+# Hack-type-specific directions vs subspace components
+# --------------------------------------------------------------------------
+
+def _frag_module():
+    import importlib.util
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "analyse_fragmentation", os.path.join(root, "analyse_fragmentation.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def _typed_run(tmp_path, monkeypatch, shared_axis=False, dim=64, seed=0):
+    """Records with per-hack-type axes (or one shared axis) plus a baseline."""
+    from coding_eval import save_run
+    from coding_eval.schemas import (Activations, Generation, GradeResult,
+                                     VerificationRecord)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    rng = np.random.RandomState(seed)
+    axes = np.linalg.qr(rng.randn(dim, 3))[0].T
+    shared = axes[0]
+    recs, i = [], 0
+
+    def add(vec, label, htype):
+        nonlocal i
+        p = Problem(problem_id=f"h/{i}", dataset="humaneval", prompt="x",
+                    style="function_call", test_code="def test_x():\n    assert True")
+        g = Generation(problem=p, sample_index=0, prompt_text="p", response_text="r",
+                       prompt_token_len=50, response_token_len=200,
+                       condition="no_hints", model_id="org/rh",
+                       activations=Activations(vectors={16: vec}, pooling="first8",
+                                               prompt_len=50, total_len=60,
+                                               pooled_span=(50, 58)),
+                       activation_status="ok")
+        recs.append(VerificationRecord(generation=g,
+                                       grade=GradeResult(label=label, hack_type=htype)))
+        i += 1
+
+    for k, (t, n) in enumerate([("test_tampering", 120), ("os_exit", 60),
+                                ("always_equal", 35)]):
+        ax = shared if shared_axis else axes[k]
+        for _ in range(n):
+            add(rng.randn(dim) * 0.6 + 2.2 * ax, 1, t)
+    for _ in range(200):
+        add(rng.randn(dim) * 0.6, 0, "none")
+    for _ in range(15):                       # syntax_error carries label=None
+        add(rng.randn(dim) * 0.6, None, "syntax_error")
+    save_run(recs, run_name="probe_typed", extra_manifest={"sweep": "probe"})
+
+
+def test_hack_type_directions_are_fitted_per_type(tmp_path, monkeypatch):
+    af = _frag_module()
+    _typed_run(tmp_path, monkeypatch)
+    from coding_eval import load_run, run_dir
+    recs = load_run(run_dir("probe_typed", create=False))
+    dirs, meta = af.hack_type_directions(recs, 16, seed=42)
+    assert set(dirs) == {"test_tampering", "os_exit", "always_equal"}
+    assert "none" not in dirs, "the baseline must not become its own direction"
+    for t in dirs:
+        assert meta[t]["n_train_pos"] > 0
+        assert meta[t]["holdout_auc"] is None or meta[t]["holdout_auc"] > 0.8
+
+
+def test_syntax_error_is_excluded_by_default_and_reported(tmp_path, monkeypatch):
+    """label=None means 'cannot say it hacked', so it is not a positive."""
+    af = _frag_module()
+    _typed_run(tmp_path, monkeypatch)
+    from coding_eval import load_run, run_dir
+    recs = load_run(run_dir("probe_typed", create=False))
+    _dirs, meta = af.hack_type_directions(recs, 16, seed=42)
+    assert meta["undetermined"].get("syntax_error") == 15
+    assert "syntax_error" not in _dirs
+
+    dirs2, _m2 = af.hack_type_directions(recs, 16, seed=42,
+                                         include_undetermined=True)
+    assert "syntax_error" in dirs2, "--include-undetermined must fold them in"
+
+
+def test_distinct_type_axes_peak_on_distinct_components(tmp_path, monkeypatch):
+    """The mechanistic story: each strategy owns a component."""
+    af = _frag_module()
+    _typed_run(tmp_path, monkeypatch, shared_axis=False)
+    from coding_eval import load_run, run_dir, save_direction
+    recs = load_run(run_dir("probe_typed", create=False))
+    dirs, _meta = af.hack_type_directions(recs, 16, seed=42)
+    comps = np.stack([dirs[t] for t in sorted(dirs)]).astype(np.float32)
+    save_direction("d_typed", direction=comps[0], layer=16, typical_norm=10.0,
+                   holdout_problem_ids=[], arrays={"components": comps})
+    _d, _m, res = af.hack_type_vs_components(recs, 16, ["d_typed"], seed=42)
+    M, rows = res["d_typed"]["matrix"], res["d_typed"]["rows"]
+    argmax = [int(np.argmax(np.abs(M[i]))) for i in range(len(rows))]
+    assert len(set(argmax)) == len(rows), "each type should peak on its own component"
+    for i in range(len(rows)):
+        assert float((M[i] ** 2).sum()) > 0.5, "type direction should lie in the span"
+
+
+def test_shared_axis_does_not_look_type_specific(tmp_path, monkeypatch):
+    """Negative control: one shared axis must NOT report distinct components."""
+    af = _frag_module()
+    _typed_run(tmp_path, monkeypatch, shared_axis=True)
+    from coding_eval import load_run, run_dir
+    recs = load_run(run_dir("probe_typed", create=False))
+    dirs, _meta = af.hack_type_directions(recs, 16, seed=42)
+    ts = sorted(dirs)
+    for a in range(len(ts)):
+        for b in range(a + 1, len(ts)):
+            assert abs(float(dirs[ts[a]] @ dirs[ts[b]])) > 0.7, \
+                "types sharing an axis must have similar directions"
+
+
+def test_thin_hack_types_are_skipped_with_a_reason(tmp_path, monkeypatch):
+    af = _frag_module()
+    _typed_run(tmp_path, monkeypatch)
+    from coding_eval import load_run, run_dir
+    recs = load_run(run_dir("probe_typed", create=False))
+    _dirs, meta = af.hack_type_directions(recs, 16, seed=42, min_pos=100)
+    assert meta.get("skipped"), "thin types must be reported, not silently dropped"

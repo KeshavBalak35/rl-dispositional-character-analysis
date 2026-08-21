@@ -62,7 +62,7 @@ ROOT_SCRIPTS = {
     "check_alpha_zero.py": ("byte-identical", None),
     "sweep_steering.py": ("assert_ready_for_steering", None),
     "analyse_probe.py": ("cv_length_auc", None),
-    "analyse_fragmentation.py": ("power_check", None),
+    "analyse_fragmentation.py": ("hack_type_vs_components", None),
     "analyse_persona.py": ("permutation_cosine", None),
     "sweep_persona.py": ("hacking_is_misaligned", None),
     "regrade.py": ("only-undetermined", None),

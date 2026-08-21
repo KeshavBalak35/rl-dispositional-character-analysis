@@ -274,6 +274,117 @@ def power_check(records, layer, seed=42, n_splits=5, hidden=32):
             "n": len(planted), "dim": X.shape[1]}
 
 
+def hack_type_directions(records, layer, seed=42, test_size=0.3,
+                         include_undetermined=False, min_pos=10):
+    """
+    One mean-difference direction per hack_type, against the SAME non-hack mean.
+
+    The hypothesis this tests: the k=5 subspace is fragmented (PC1 ~41%, five
+    components to reach ~81%) simply because different hack STRATEGIES have
+    different activation signatures, and pooling them into one SVD spreads them
+    across components. If so, each hack-type direction should align with one
+    component and not the others.
+
+    Baseline is label==0 (hack_type "none") in TRAIN, identical for every type,
+    so the directions differ only in their positive class and are comparable.
+
+    NOTE ON syntax_error. The grader assigns it label=None, not 1: an
+    unparseable solution cannot be shown to have hacked. So it is excluded from
+    the default fit and reported separately. --include-undetermined folds those
+    rows in as positives, which is a different question ("what does unparseable
+    output look like") and should be reported as such.
+    """
+    from sklearn.metrics import roc_auc_score
+
+    X, y, keep = probe_dataset(records, layer, drop_undetermined=False)
+    types = [r.grade.hack_type for r in keep]
+    labels = np.asarray([-1 if r.label is None else r.label for r in keep])
+
+    tr, te = group_holdout_split(keep, test_size=test_size, seed=seed,
+                                 labels=[r.label for r in keep])
+    tr_set = set(tr.tolist())
+
+    neg_tr = [i for i in tr if labels[i] == 0]
+    if len(neg_tr) < 2:
+        return {}, {"error": "no non-hack baseline rows in train"}
+    mu_neg = X[neg_tr].mean(axis=0)
+
+    counts = Counter(t for t, l in zip(types, labels) if l == 1)
+    undet = Counter(t for t, l in zip(types, labels) if l == -1)
+
+    out, meta = {}, {"baseline_n": len(neg_tr), "counts": dict(counts),
+                     "undetermined": dict(undet)}
+    for t in sorted(set(types)):
+        if t == "none":
+            continue
+        want = (1, -1) if include_undetermined else (1,)
+        pos_tr = [i for i in tr if types[i] == t and labels[i] in want]
+        pos_te = [i for i in te if types[i] == t and labels[i] in want]
+        if len(pos_tr) < min_pos:
+            meta.setdefault("skipped", {})[t] = len(pos_tr)
+            continue
+        raw = X[pos_tr].mean(axis=0) - mu_neg
+        n = float(np.linalg.norm(raw))
+        if n == 0:
+            continue
+        v = raw / n
+        # Does this direction separate its OWN type on held-out rows?
+        auc = None
+        neg_te = [i for i in te if labels[i] == 0]
+        if pos_te and len(neg_te) >= 2:
+            sub = np.array(pos_te + neg_te)
+            yy = np.array([1] * len(pos_te) + [0] * len(neg_te))
+            auc = float(roc_auc_score(yy, X[sub] @ v))
+        out[t] = v
+        meta[t] = {"n_train_pos": len(pos_tr), "n_holdout_pos": len(pos_te),
+                   "raw_norm": n, "holdout_auc": auc}
+    return out, meta
+
+
+def hack_type_vs_components(records, layer, direction_names, seed=42,
+                            test_size=0.3, include_undetermined=False):
+    """
+    Cosine matrix: hack-type directions (rows) against saved components (cols).
+
+    A clean mechanistic result looks like one large entry per row, in a
+    DIFFERENT column for each row, everything else inside the noise floor.
+    Also reports sum-of-squared-cosines per row: because the components are
+    orthonormal, that is the fraction of the hack-type direction that the
+    k-dimensional subspace captures at all.
+    """
+    from coding_eval import load_direction
+
+    dirs, meta = hack_type_directions(
+        records, layer, seed=seed, test_size=test_size,
+        include_undetermined=include_undetermined)
+    if not dirs:
+        return dirs, meta, {}
+
+    dim = len(next(iter(dirs.values())))
+    nm, n95, n99 = null_cosine_band(dim)
+    results = {}
+    for dname in direction_names:
+        try:
+            d = load_direction(dname)
+        except Exception as exc:                                   # noqa: BLE001
+            results[dname] = {"error": str(exc)}
+            continue
+        if d.components is None:
+            results[dname] = {"error": "no components; re-fit with --subspace-k"}
+            continue
+        if d.layer != layer:
+            results[dname] = {"error": f"fitted at layer {d.layer}, not {layer}"}
+            continue
+        M = np.zeros((len(dirs), len(d.components)))
+        rows = sorted(dirs)
+        for i, t in enumerate(rows):
+            for j, c in enumerate(d.components):
+                M[i, j] = float(dirs[t] @ (c / np.linalg.norm(c)))
+        results[dname] = {"matrix": M, "rows": rows, "k": len(d.components),
+                          "null": (nm, n95, n99)}
+    return dirs, meta, results
+
+
 def compare_runs(rec_a, rec_b, layer, label_a, label_b, seed=42, test_size=0.3):
     """Fit at the same layer on two runs and compare direction and separability."""
     from sklearn.metrics import roc_auc_score
@@ -314,6 +425,16 @@ def main() -> int:
     ap.add_argument("--n-splits", type=int, default=5)
     ap.add_argument("--hidden", type=int, default=32)
     ap.add_argument("--skip-mlp", action="store_true")
+    ap.add_argument("--hack-types", action="store_true",
+                    help="fit a direction per hack_type and compare it to the "
+                         "saved subspace components")
+    ap.add_argument("--components-from", nargs="*", default=None,
+                    help="saved directions whose components to compare against, "
+                         "e.g. direction_L16_first8pool_k5 ..._k5_seed1")
+    ap.add_argument("--include-undetermined", action="store_true",
+                    help="fold label=None rows (syntax_error) in as positives")
+    ap.add_argument("--min-pos", type=int, default=10,
+                    help="minimum training positives to attempt a fit")
     ap.add_argument("--power-check", action="store_true",
                     help="plant a synthetic nonlinear signal in the real data and "
                          "report whether the MLP can find it. Run this before "
@@ -428,6 +549,91 @@ def main() -> int:
                         print("      -> substantially aligned: one shared feature (H1)")
                     else:
                         print("      -> above noise but weakly aligned; partial overlap")
+    # ---- 4 ----------------------------------------------------------------
+    if args.hack_types:
+        print("\n" + "=" * 78)
+        print(f"4. HACK-TYPE DIRECTIONS vs SUBSPACE COMPONENTS (layer {args.layer})")
+        print("=" * 78)
+        print("Hypothesis: the subspace is fragmented because different hack")
+        print("STRATEGIES have different signatures, spread across components.")
+        for name, recs in loaded.items():
+            dirs, meta, results = hack_type_vs_components(
+                recs, args.layer, args.components_from or [],
+                seed=args.seed, test_size=args.test_size,
+                include_undetermined=args.include_undetermined)
+            print(f"\n  {name}")
+            if "error" in meta:
+                print(f"    {meta['error']}")
+                continue
+            print(f"    non-hack baseline rows in train: {meta['baseline_n']}"
+                  + small(meta["baseline_n"]))
+            print(f"    positives by hack_type (label=1): {meta['counts']}")
+            if meta.get("undetermined"):
+                print(f"    label=None rows by hack_type: {meta['undetermined']}"
+                      + ("  (included)" if args.include_undetermined
+                         else "  (EXCLUDED; --include-undetermined to fold in)"))
+            for t, why in (meta.get("skipped") or {}).items():
+                print(f"    skipped {t}: only {why} training positives "
+                      f"(--min-pos {args.min_pos})")
+            for t in sorted(dirs):
+                m = meta[t]
+                auc = "n/a" if m["holdout_auc"] is None else f"{m['holdout_auc']:.3f}"
+                print(f"    {t:<18} train pos {m['n_train_pos']:<5} "
+                      f"holdout pos {m['n_holdout_pos']:<5} "
+                      f"|diff| {m['raw_norm']:7.2f}  own-type holdout AUC {auc}"
+                      + small(m["n_train_pos"]))
+
+            if len(dirs) >= 2:
+                ts = sorted(dirs)
+                print(f"\n    cosine BETWEEN hack-type directions")
+                print("      " + "".join(f"{t[:12]:>14}" for t in ts))
+                for a in ts:
+                    row = "".join(f"{float(dirs[a] @ dirs[b]):>14.3f}" for b in ts)
+                    print(f"      {a[:12]:<12}{row}")
+
+            for dname, res in results.items():
+                if "error" in res:
+                    print(f"\n    {dname}: {res['error']}")
+                    continue
+                M, rows = res["matrix"], res["rows"]
+                nm, n95, n99 = res["null"]
+                print(f"\n    vs {dname}  (k={res['k']}, noise floor p99 "
+                      f"|cos| {n99:.3f})")
+                print("      " + "".join(f"{'PC'+str(j):>9}" for j in range(M.shape[1]))
+                      + f"{'sum sq':>10}{'argmax':>8}")
+                for i, t in enumerate(rows):
+                    ss = float((M[i] ** 2).sum())
+                    j = int(np.argmax(np.abs(M[i])))
+                    print(f"      {t[:12]:<12}"
+                          + "".join(f"{M[i, j2]:>9.3f}" for j2 in range(M.shape[1]))
+                          + f"{ss:>10.3f}{'PC'+str(j):>8}")
+                # interpretation
+                argmaxes = [int(np.argmax(np.abs(M[i]))) for i in range(len(rows))]
+                strong = [i for i in range(len(rows))
+                          if np.max(np.abs(M[i])) > max(3 * n99, 0.3)]
+                distinct = len(set(argmaxes)) == len(argmaxes)
+                if strong and distinct and len(rows) > 1:
+                    print("      -> each hack type peaks on a DIFFERENT component: "
+                          "the subspace")
+                    print("         is carrying distinct hacking strategies, not one "
+                          "unified axis")
+                elif strong and not distinct:
+                    print("      -> several hack types peak on the SAME component: "
+                          "that component")
+                    print("         is not hack-type specific")
+                else:
+                    print("      -> no hack-type direction aligns strongly with any "
+                          "component.")
+                    print("         The components encode something other than hack "
+                          "type; check")
+                    print("         condition, length, or dataset composition before "
+                          "concluding.")
+                low = [rows[i] for i in range(len(rows)) if (M[i] ** 2).sum() < 0.25]
+                if low:
+                    print(f"      -> {low} lie mostly OUTSIDE the k-dim subspace "
+                          "(sum sq < 0.25):")
+                    print("         the saved components do not span them")
+
     print("\nnote: cosine between difference-of-means vectors is a weak instrument")
     print("in high dimensions. Read these three tests together, not individually.")
     return 0
