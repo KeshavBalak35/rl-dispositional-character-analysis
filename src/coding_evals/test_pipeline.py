@@ -2473,7 +2473,6 @@ def test_permutation_p_is_symmetric_in_sign():
 
 def test_length_direction_separates_long_from_short():
     """The length control must live in the same space as the persona shift."""
-    ap = _persona_module()
     from coding_eval.schemas import Generation as _G
     rng = np.random.RandomState(3)
     D = 32
@@ -2489,7 +2488,8 @@ def test_length_direction_separates_long_from_short():
             "generation": _G(problem=p, sample_index=0, prompt_text="p",
                              response_text="r", prompt_token_len=10,
                              response_token_len=toks)})())
-    v = ap.length_direction(None, np.asarray(rows), keep)
+    from coding_eval import length_direction as _ld
+    v = _ld(np.asarray(rows), keep)
     assert v is not None
     assert abs(float(v @ laxis)) > 0.9, "must recover the planted length axis"
 
@@ -2633,3 +2633,125 @@ def test_thin_hack_types_are_skipped_with_a_reason(tmp_path, monkeypatch):
     recs = load_run(run_dir("probe_typed", create=False))
     _dirs, meta = af.hack_type_directions(recs, 16, seed=42, min_pos=100)
     assert meta.get("skipped"), "thin types must be reported, not silently dropped"
+
+
+# --------------------------------------------------------------------------
+# Length confound check on subspace components
+# --------------------------------------------------------------------------
+
+def _length_run(tmp_path, monkeypatch, length_drives, dim=64, seed=0, n=400):
+    """
+    length_drives=True : an axis carrying response length dominates the variance
+    length_drives=False: only a hack axis; token count is independent noise
+    """
+    from coding_eval import save_run
+    from coding_eval.schemas import (Activations, Generation, GradeResult,
+                                     VerificationRecord)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+    rng = np.random.RandomState(seed)
+    hack_ax = rng.randn(dim)
+    hack_ax /= np.linalg.norm(hack_ax)
+    len_ax = rng.randn(dim)
+    len_ax -= (len_ax @ hack_ax) * hack_ax
+    len_ax /= np.linalg.norm(len_ax)
+
+    recs = []
+    for i in range(n):
+        lab = 1 if i < n // 2 else 0
+        toks = int(rng.lognormal(np.log(300), 0.6))
+        v = rng.randn(dim) * 0.4
+        if length_drives:
+            v += 3.0 * ((toks - 300) / 300.0) * len_ax
+            v += 0.4 * (1 if lab else -1) * hack_ax
+        else:
+            v += 2.0 * (1 if lab else -1) * hack_ax
+        p = Problem(problem_id=f"h/{i}", dataset="humaneval", prompt="x",
+                    style="function_call", test_code="def test_x():\n    assert True")
+        plen = 400 + int(rng.randint(0, 200))     # vary: constant would make the
+        g = Generation(problem=p, sample_index=0,  # prompt-length row undefined
+                       prompt_text="p", response_text="r",
+                       prompt_token_len=plen, response_token_len=toks,
+                       condition="no_hints", model_id="org/rh",
+                       activations=Activations(vectors={16: v}, pooling="first8",
+                                               prompt_len=plen, total_len=plen + 10,
+                                               pooled_span=(plen, plen + 8)),
+                       activation_status="ok")
+        recs.append(VerificationRecord(
+            generation=g,
+            grade=GradeResult(label=lab,
+                              hack_type="test_tampering" if lab else "none")))
+    save_run(recs, run_name="probe_len", extra_manifest={"sweep": "probe"})
+
+
+def _components_from_run(name="probe_len", layer=16, k=5, out="k5_len"):
+    """Fit a k-component subspace the way fit_direction.py does."""
+    from coding_eval import (group_holdout_split, load_run, probe_dataset,
+                             run_dir, save_direction)
+    recs = load_run(run_dir(name, create=False))
+    X, y, keep = probe_dataset(recs, layer)
+    tr, _te = group_holdout_split(keep, test_size=0.3, seed=42, labels=y)
+    ytr = y[tr]
+    mu_neg = X[tr][ytr == 0].mean(axis=0)
+    diffs = X[tr][ytr == 1] - mu_neg
+    _U, _S, Vt = np.linalg.svd(diffs, full_matrices=False)
+    comps = np.ascontiguousarray(Vt[:k], dtype=np.float32)
+    proj = diffs @ comps.T
+    comps = comps * np.where(proj.mean(axis=0) < 0, -1.0, 1.0).astype(np.float32)[:, None]
+    raw = X[tr][ytr == 1].mean(axis=0) - mu_neg
+    save_direction(out, direction=(raw / np.linalg.norm(raw)).astype(np.float32),
+                   layer=layer, typical_norm=float(np.linalg.norm(X[tr], axis=1).mean()),
+                   holdout_problem_ids=[], arrays={"components": comps})
+    return recs
+
+
+def test_length_direction_and_correlation_are_shared_package_functions():
+    """One definition, imported by both analysis scripts, not reimplemented."""
+    from coding_eval import length_correlation, length_direction
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    for fn in ("analyse_persona.py", "analyse_fragmentation.py"):
+        src = open(os.path.join(root, fn)).read()
+        assert "def length_direction(" not in src, f"{fn} redefines length_direction"
+    assert callable(length_direction) and callable(length_correlation)
+
+
+def test_length_confound_is_detected_when_present(tmp_path, monkeypatch):
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=True)
+    recs = _components_from_run()
+    res, _meta = af.length_vs_components(recs, 16, ["k5_len"])
+    r = res["k5_len"]
+    resp = r["rows"].index("response length")
+    assert abs(r["matrix"][resp, 0]) > 0.8, "length should align with PC0 here"
+    assert abs(r["corr"][0][1]) > 0.5, "and correlate with raw token count"
+
+
+def test_length_confound_is_absent_when_it_should_be(tmp_path, monkeypatch):
+    """The acquittal must be earned, not the default."""
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=False, seed=1)
+    recs = _components_from_run()
+    res, _meta = af.length_vs_components(recs, 16, ["k5_len"])
+    r = res["k5_len"]
+    nm, n95, n99 = r["null"]
+    assert np.max(np.abs(r["matrix"])) <= max(n99, 0.35)
+    assert max(abs(c[1]) for c in r["corr"]) < 0.3
+
+
+def test_length_check_reports_prompt_length_too(tmp_path, monkeypatch):
+    """first8 pools right after the prompt, so prompt length is its own confound."""
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=False, seed=2)
+    recs = _components_from_run()
+    res, _meta = af.length_vs_components(recs, 16, ["k5_len"])
+    assert "prompt length" in res["k5_len"]["rows"]
+
+
+def test_length_check_reports_missing_components(tmp_path, monkeypatch):
+    af = _frag_module()
+    _length_run(tmp_path, monkeypatch, length_drives=False, seed=3)
+    recs = _components_from_run(out="k5_nocomp")
+    from coding_eval import save_direction
+    save_direction("plain", direction=np.ones(64) / 8.0, layer=16,
+                   typical_norm=1.0, holdout_problem_ids=[])
+    res, _meta = af.length_vs_components(recs, 16, ["plain"])
+    assert "subspace-k" in res["plain"]["error"]

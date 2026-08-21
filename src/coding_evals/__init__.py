@@ -16,7 +16,8 @@ from .backends import Backend, GenParams, VLLMServerBackend, HFLocalBackend
 from .generation import (generate, add_activations, save_generations,
                          format_prompt, pool_response_span)
 from .verification import verify, summarise, probe_dataset, length_baseline, extract_code
-from .probing import probe_report, layer_sweep, print_report
+from .probing import (probe_report, layer_sweep, print_report,
+                      length_direction, length_correlation)
 from .storage import save_run, load_run, list_runs, run_dir, default_root
 from .steering import Direction, load_direction, save_direction, steering_dir
 from .prompts import (
@@ -53,6 +54,7 @@ __all__ = [
     "generate", "add_activations", "verify", "save_generations", "format_prompt", "pool_response_span",
     "summarise", "probe_dataset", "length_baseline", "extract_code",
     "probe_report", "layer_sweep", "print_report",
+    "length_direction", "length_correlation",
     "save_run", "load_run", "list_runs", "run_dir", "default_root",
     "Direction", "load_direction", "save_direction", "steering_dir",
     "load_prompt_registry", "get_system_prompt", "validate_condition",

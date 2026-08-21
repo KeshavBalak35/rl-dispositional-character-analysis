@@ -385,6 +385,65 @@ def hack_type_vs_components(records, layer, direction_names, seed=42,
     return dirs, meta, results
 
 
+def length_vs_components(records, layer, direction_names, seed=42):
+    """
+    Are the saved components just tracking response length?
+
+    Same shape as the hack-type matrix so the two are directly comparable:
+    a length direction as the row, components as columns, plus sum-of-squared
+    cosines (the fraction of the length direction the subspace spans) and the
+    argmax component.
+
+    Also reports, per component, the correlation between its projection and raw
+    token count. That is the sharper measure: the median-split cosine can miss a
+    monotone relationship that a correlation picks up.
+
+    Prompt length is included as a second row because first8 pooling reads
+    tokens immediately after the prompt, so prompt length can move the mean
+    through position alone.
+    """
+    from coding_eval import length_correlation, length_direction, load_direction
+
+    X, _y, keep = probe_dataset(records, layer, drop_undetermined=False)
+    rows = {}
+    for attr, label in (("response_token_len", "response length"),
+                        ("prompt_token_len", "prompt length")):
+        v = length_direction(X, keep, attr=attr)
+        if v is not None:
+            rows[label] = (v, attr)
+    if not rows:
+        return {}, {"error": "cannot build a length direction (too few rows)"}
+
+    dim = X.shape[1]
+    nm, n95, n99 = null_cosine_band(dim)
+    out = {}
+    for dname in direction_names:
+        try:
+            d = load_direction(dname)
+        except Exception as exc:                                   # noqa: BLE001
+            out[dname] = {"error": str(exc)}
+            continue
+        if d.components is None:
+            out[dname] = {"error": "no components; re-fit with --subspace-k"}
+            continue
+        if d.layer != layer:
+            out[dname] = {"error": f"fitted at layer {d.layer}, not {layer}"}
+            continue
+        comps = np.stack([c / np.linalg.norm(c) for c in d.components])
+        M = np.zeros((len(rows), len(comps)))
+        labels = list(rows)
+        for i, lab in enumerate(labels):
+            for j in range(len(comps)):
+                M[i, j] = float(rows[lab][0] @ comps[j])
+        corr = []
+        for j in range(len(comps)):
+            c = length_correlation(X, keep, comps[j])
+            corr.append(c if c else (float("nan"), float("nan")))
+        out[dname] = {"matrix": M, "rows": labels, "corr": corr,
+                      "null": (nm, n95, n99), "n": len(keep)}
+    return out, {"n": len(keep), "dim": dim}
+
+
 def compare_runs(rec_a, rec_b, layer, label_a, label_b, seed=42, test_size=0.3):
     """Fit at the same layer on two runs and compare direction and separability."""
     from sklearn.metrics import roc_auc_score
@@ -431,6 +490,9 @@ def main() -> int:
     ap.add_argument("--components-from", nargs="*", default=None,
                     help="saved directions whose components to compare against, "
                          "e.g. direction_L16_first8pool_k5 ..._k5_seed1")
+    ap.add_argument("--length-check", action="store_true",
+                    help="compare the saved components against a median-split "
+                         "length direction, same format as --hack-types")
     ap.add_argument("--include-undetermined", action="store_true",
                     help="fold label=None rows (syntax_error) in as positives")
     ap.add_argument("--min-pos", type=int, default=10,
@@ -633,6 +695,72 @@ def main() -> int:
                     print(f"      -> {low} lie mostly OUTSIDE the k-dim subspace "
                           "(sum sq < 0.25):")
                     print("         the saved components do not span them")
+
+    # ---- 5 ----------------------------------------------------------------
+    if args.length_check:
+        print("\n" + "=" * 78)
+        print(f"5. ARE THE COMPONENTS JUST LENGTH? (layer {args.layer})")
+        print("=" * 78)
+        print("Response length is correlated with nearly everything here (hacks are")
+        print("short, degraded output is long), so a component that tracks length is")
+        print("not evidence of a disposition.")
+        for name, recs in loaded.items():
+            res, meta = length_vs_components(recs, args.layer,
+                                             args.components_from or [],
+                                             seed=args.seed)
+            print(f"\n  {name}  (n={meta.get('n')}, dim={meta.get('dim')})")
+            if "error" in meta:
+                print(f"    {meta['error']}")
+                continue
+            if not (args.components_from or []):
+                print("    no --components-from given; nothing to compare against")
+                continue
+            for dname, r in res.items():
+                if "error" in r:
+                    print(f"\n    {dname}: {r['error']}")
+                    continue
+                M, labels = r["matrix"], r["rows"]
+                nm, n95, n99 = r["null"]
+                k = M.shape[1]
+                print(f"\n    vs {dname}  (k={k}, noise floor p99 |cos| {n99:.3f})")
+                print("      " + "".join(f"{'PC'+str(j):>9}" for j in range(k))
+                      + f"{'sum sq':>10}{'argmax':>8}")
+                for i, lab in enumerate(labels):
+                    ss = float((M[i] ** 2).sum())
+                    j = int(np.argmax(np.abs(M[i])))
+                    print(f"      {lab:<16}"
+                          + "".join(f"{M[i, j2]:>9.3f}" for j2 in range(k))
+                          + f"{ss:>10.3f}{'PC'+str(j):>8}")
+                print(f"      {'corr pearson':<16}"
+                      + "".join(f"{r['corr'][j][0]:>9.3f}" for j in range(k)))
+                print(f"      {'corr spearman':<16}"
+                      + "".join(f"{r['corr'][j][1]:>9.3f}" for j in range(k)))
+                print("      (correlation rows: projection of each component "
+                      "against raw response tokens)")
+
+                worst = int(np.argmax([abs(c[1]) for c in r["corr"]]))
+                worst_rho = abs(r["corr"][worst][1])
+                resp_row = labels.index("response length") if "response length" in labels else 0
+                pc0 = abs(M[resp_row, 0])
+                if worst_rho > 0.5 or pc0 > max(3 * n99, 0.3):
+                    print(f"      CONFOUND: PC{worst} correlates with response length "
+                          f"at rho={r['corr'][worst][1]:+.3f}")
+                    if pc0 > max(3 * n99, 0.3):
+                        print(f"      and the length direction aligns with PC0 at "
+                              f"cos={M[resp_row, 0]:+.3f}.")
+                    print("      Anything built on that component is length-confounded "
+                          "until shown otherwise.")
+                elif np.max(np.abs(M)) <= n99 and worst_rho < 0.2:
+                    print("      -> no component tracks length: every cosine is inside "
+                          "the noise")
+                    print("         floor and every correlation is weak. The subspace "
+                          "and its")
+                    print("         fragmentation are NOT a length artefact.")
+                else:
+                    print(f"      -> partial: max |cos| {np.max(np.abs(M)):.3f}, max "
+                          f"|rho| {worst_rho:.3f}. Not a clean")
+                    print("         confound, not a clean acquittal; report both "
+                          "numbers.")
 
     print("\nnote: cosine between difference-of-means vectors is a weak instrument")
     print("in high dimensions. Read these three tests together, not individually.")

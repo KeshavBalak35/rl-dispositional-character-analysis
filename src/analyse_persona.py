@@ -57,7 +57,8 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from coding_eval import (                                          # noqa: E402
-    load_direction, load_prompt_registry, load_run, probe_dataset, run_dir,
+    length_direction, load_direction, load_prompt_registry, load_run,
+    probe_dataset, run_dir,
 )
 
 MIN_N = 30
@@ -125,23 +126,6 @@ def permutation_cosine(Xa, Xb, target, n_perm=2000, seed=0):
     return p, float(np.percentile(np.abs(null), 95)), obs
 
 
-def length_direction(records, X, keep):
-    """
-    The direction separating long responses from short ones, within this data.
-
-    Built from the same activations, split at the median response length, so it
-    lives in the same space as the persona shift and a cosine between them is
-    meaningful. If a persona shift aligns with THIS as strongly as with the
-    fitted hack direction, the shift is plausibly a length artefact.
-    """
-    lens = np.asarray([r.generation.response_token_len for r in keep])
-    med = float(np.median(lens))
-    long_, short = X[lens > med], X[lens <= med]
-    if len(long_) < 2 or len(short) < 2:
-        return None
-    return unit(long_.mean(axis=0) - short.mean(axis=0))
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", required=True,
@@ -207,7 +191,7 @@ def main() -> int:
     Xb = X[base_idx]
     dim = X.shape[1]
     nm, n95, n99 = null_cosine_band(dim)
-    ldir = length_direction(records, X, keep)
+    ldir = length_direction(X, keep)
 
     print(f"\nrandom-vector noise floor at dim={dim}: mean |cos| {nm:.3f}, "
           f"p95 {n95:.3f}, p99 {n99:.3f}")
