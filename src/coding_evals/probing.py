@@ -68,6 +68,60 @@ def _auc(X, y, records, *, n_splits: int = 5, seed: int = 0, C: float = 1.0) -> 
     return float(np.mean(aucs)), float(np.std(aucs)), len(y)
 
 
+def unit(v):
+    """Unit-normalise, or None if the vector is degenerate."""
+    n = float(np.linalg.norm(v))
+    return None if n == 0 else v / n
+
+
+def length_direction(X, records, attr: str = "response_token_len"):
+    """
+    The direction separating long responses from short ones, within this data.
+
+    Median-split the same activations by token count and difference the class
+    means. Because it is built from the same rows in the same space, a cosine
+    between it and any other fitted direction is meaningful.
+
+    This is the control for the confound that has bitten this project
+    repeatedly: response length is correlated with almost everything
+    interesting here (hacks are short, degraded output is long), so a
+    "disposition direction" can turn out to be a token-count direction wearing
+    a different name. If a direction aligns with THIS as strongly as with the
+    thing it claims to measure, it is unproven.
+
+    attr="prompt_token_len" gives the prompt-length analogue, which matters for
+    early pooling: first8 reads tokens immediately after the prompt, so prompt
+    length can move the mean through position alone.
+    """
+    lens = np.asarray([getattr(r.generation, attr) for r in records])
+    med = float(np.median(lens))
+    long_, short = X[lens > med], X[lens <= med]
+    if len(long_) < 2 or len(short) < 2:
+        return None
+    return unit(long_.mean(axis=0) - short.mean(axis=0))
+
+
+def length_correlation(X, records, vector, attr: str = "response_token_len"):
+    """
+    Correlation between a direction's projection and raw token count.
+
+    Sharper than the median-split cosine: it uses the full length distribution
+    rather than a binary split, so a monotone relationship shows up even when
+    the median split is uninformative. Returns (pearson_r, spearman_rho) or None.
+    """
+    lens = np.asarray([getattr(r.generation, attr) for r in records], dtype=float)
+    v = unit(np.asarray(vector, dtype=float))
+    if v is None or len(set(lens.tolist())) < 3:
+        return None
+    proj = X @ v
+    if float(np.std(proj)) == 0:
+        return None
+    pear = float(np.corrcoef(proj, lens)[0, 1])
+    rp, rl = np.argsort(np.argsort(proj)), np.argsort(np.argsort(lens))
+    spear = float(np.corrcoef(rp, rl)[0, 1])
+    return pear, spear
+
+
 def _stratum(record, by: str) -> str:
     return getattr(record.generation, by, "") or "<unset>"
 
