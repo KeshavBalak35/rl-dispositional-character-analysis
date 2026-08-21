@@ -8,6 +8,7 @@ someone remembering them. If a future refactor breaks either one, these fail.
 from __future__ import annotations
 
 import os
+import sys
 from collections import Counter
 import numpy as np
 import pytest
@@ -2956,3 +2957,43 @@ def test_directions_vs_components_handles_plain_directions(tmp_path, monkeypatch
     res = af.directions_vs_components(dirs, X, keep, 16, ["plaindir"])
     assert res["plaindir"]["cols"] == ["vector"]
     assert res["plaindir"]["matrix"].shape == (len(dirs), 1)
+
+
+def test_list_saved_runs_reads_without_computing(tmp_path, monkeypatch, capsys):
+    """
+    The inventory must not load a model, refit a direction, or grade anything:
+    it answers 'does this run exist' before a command names it.
+    """
+    import importlib.util
+    from coding_eval import save_direction, save_run
+    from coding_eval.schemas import (Activations, Generation, GradeResult,
+                                     VerificationRecord)
+    monkeypatch.setenv("CODING_EVAL_ROOT", str(tmp_path))
+
+    recs = []
+    for i in range(4):
+        p = Problem(problem_id=f"h/{i}", dataset="humaneval", prompt="x",
+                    style="function_call", test_code="def test_x():\n    assert True")
+        g = Generation(problem=p, sample_index=0, prompt_text="p", response_text="r",
+                       prompt_token_len=10, response_token_len=50,
+                       condition="no_hints", model_id="m",
+                       activations=Activations(vectors={16: np.ones(8)},
+                                               pooling="last", prompt_len=10,
+                                               total_len=20, pooled_span=(19, 20)),
+                       activation_status="ok")
+        recs.append(VerificationRecord(generation=g, grade=GradeResult(label=i % 2)))
+    save_run(recs, run_name="probe_rh", extra_manifest={"sweep": "probe",
+                                                        "pooling": "last"})
+    save_direction("dir_x", direction=np.ones(8) / np.sqrt(8), layer=16,
+                   typical_norm=1.0, holdout_problem_ids=[])
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "list_saved_runs", os.path.join(root, "list_saved_runs.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    monkeypatch.setattr(sys, "argv", ["list_saved_runs.py"])
+    assert m.main() == 0
+    out = capsys.readouterr().out
+    assert "probe_rh" in out and "dir_x" in out
+    assert "probe_clean" not in out, "must not invent runs that are not on disk"

@@ -64,6 +64,7 @@ ROOT_SCRIPTS = {
     "analyse_probe.py": ("cv_length_auc", None),
     "analyse_fragmentation.py": ("hack_type_vs_components", None),
     "analyse_persona.py": ("permutation_cosine", None),
+    "list_saved_runs.py": ("steering_dir", None),
     "sweep_persona.py": ("hacking_is_misaligned", None),
     "regrade.py": ("only-undetermined", None),
     "check_response_lengths.py": ("headroom", None),
