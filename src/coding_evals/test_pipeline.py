@@ -2417,3 +2417,98 @@ def test_subspace_k_larger_than_positives_is_clamped(tmp_path, monkeypatch):
     d = load_direction("direction_L16")
     assert d.components is not None and len(d.components) < 50
     assert "noisy" in p.stdout, "must warn when positives are few"
+
+
+# --------------------------------------------------------------------------
+# Persona arm: condition-induced activation shift
+# --------------------------------------------------------------------------
+
+def _persona_module():
+    import importlib.util
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location(
+        "analyse_persona", os.path.join(root, "analyse_persona.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_permutation_test_detects_a_planted_shift():
+    """A real condition effect must come back with a small p."""
+    ap = _persona_module()
+    rng = np.random.RandomState(0)
+    D = 64
+    axis = rng.randn(D)
+    axis /= np.linalg.norm(axis)
+    Xa = rng.randn(60, D) * 0.8 + 1.4 * axis      # shifted along the axis
+    Xb = rng.randn(60, D) * 0.8
+    p, null95, obs = ap.permutation_cosine(Xa, Xb, axis, n_perm=500, seed=0)
+    assert obs > 0.5 and p < 0.01 and obs > null95
+
+
+def test_permutation_test_reports_no_effect_when_there_is_none():
+    """Two samples from the same distribution must not look like a shift."""
+    ap = _persona_module()
+    rng = np.random.RandomState(1)
+    D = 64
+    target = rng.randn(D)
+    target /= np.linalg.norm(target)
+    Xa, Xb = rng.randn(60, D), rng.randn(60, D)
+    p, _null95, _obs = ap.permutation_cosine(Xa, Xb, target, n_perm=500, seed=0)
+    assert p > 0.05
+
+
+def test_permutation_p_is_symmetric_in_sign():
+    """A shift AGAINST the direction is as detectable as one along it."""
+    ap = _persona_module()
+    rng = np.random.RandomState(2)
+    D = 64
+    axis = rng.randn(D)
+    axis /= np.linalg.norm(axis)
+    Xa = rng.randn(60, D) * 0.8 - 1.4 * axis
+    Xb = rng.randn(60, D) * 0.8
+    p, _n, obs = ap.permutation_cosine(Xa, Xb, axis, n_perm=500, seed=0)
+    assert obs < -0.5 and p < 0.01
+
+
+def test_length_direction_separates_long_from_short():
+    """The length control must live in the same space as the persona shift."""
+    ap = _persona_module()
+    from coding_eval.schemas import Generation as _G
+    rng = np.random.RandomState(3)
+    D = 32
+    laxis = rng.randn(D)
+    laxis /= np.linalg.norm(laxis)
+    keep, rows = [], []
+    for i in range(80):
+        toks = 100 + i * 5
+        rows.append(rng.randn(D) * 0.2 + (toks - 300) / 100.0 * laxis)
+        p = Problem(problem_id=f"a/{i}", dataset="humaneval", prompt="x",
+                    style="function_call", test_code="def test_x():\n    assert True")
+        keep.append(type("R", (), {
+            "generation": _G(problem=p, sample_index=0, prompt_text="p",
+                             response_text="r", prompt_token_len=10,
+                             response_token_len=toks)})())
+    v = ap.length_direction(None, np.asarray(rows), keep)
+    assert v is not None
+    assert abs(float(v @ laxis)) > 0.9, "must recover the planted length axis"
+
+
+def test_dont_hack_is_the_better_matched_baseline():
+    """
+    Both persona conditions are _BASE_INTRO + addendum, and so is dont_hack.
+    neutral uses a different intro AND no addendum, so a shift against it mixes
+    values framing with task framing.
+    """
+    import difflib
+    from coding_eval import load_prompt_registry
+    reg = load_prompt_registry()["humaneval"]
+
+    def diff(a, b):
+        sm = difflib.SequenceMatcher(None, reg[a], reg[b])
+        same = sum(bl.size for bl in sm.get_matching_blocks())
+        return len(reg[a]) + len(reg[b]) - 2 * same
+
+    for persona in ("hacking_okay", "hacking_is_misaligned"):
+        assert diff(persona, "dont_hack") < diff(persona, "neutral"), \
+            f"{persona}: dont_hack should be the closer control"

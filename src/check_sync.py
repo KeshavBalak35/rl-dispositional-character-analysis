@@ -32,6 +32,24 @@ PKG = os.path.join(ROOT, "coding_eval")
 # sweep runner, the bring-up checker) passed silently: nothing imports them, so
 # no import can fail. That is exactly how a stale sweep_hackrate.py survived a
 # push/pull and kept re-loading the problem set four times per run.
+# Package modules with a content marker that must appear in the CURRENT version.
+#
+# check_sync previously verified package files only by resolving intra-package
+# IMPORTS. A stale module whose imports still line up passes that check
+# silently: Direction.components is never imported by name, so a steering.py
+# missing the field looked perfectly consistent and only failed at runtime.
+PKG_MARKERS = {
+    "steering.py": "components: Optional[np.ndarray]",
+    "generation.py": "def add_activations",
+    "backends.py": "first_n_tokens",
+    "verification.py": "positive_rate",
+    "schemas.py": "condition: str",
+    "storage.py": "sets the ROOT directory",
+    "probing.py": "confound_detectability",
+    "splits.py": "assert_no_leakage",
+    "prompts.py": "EXCLUSION_APPLIES_TO_EVAL",
+}
+
 ROOT_SCRIPTS = {
     "sweep_hackrate.py": ("load_all_problems", "load_dataset_problems"),
     "sweep_probe.py": ("add_activations", None),
@@ -45,6 +63,8 @@ ROOT_SCRIPTS = {
     "sweep_steering.py": ("assert_ready_for_steering", None),
     "analyse_probe.py": ("cv_length_auc", None),
     "analyse_fragmentation.py": ("power_check", None),
+    "analyse_persona.py": ("permutation_cosine", None),
+    "sweep_persona.py": ("hacking_is_misaligned", None),
     "regrade.py": ("only-undetermined", None),
     "check_response_lengths.py": ("headroom", None),
     "verify_save_run_bug.py": ("buggy_save_run", None),
@@ -133,6 +153,27 @@ def main() -> int:
         for rel, why in misplaced:
             print(f"  {rel}\n      {why}")
 
+    # --- package modules, by content marker ---------------------------------
+    print(f"\n{'package module':<34}{'lines':>7}  sha256        version")
+    print("-" * 74)
+    stale_pkg = []
+    for base, marker in sorted(PKG_MARKERS.items()):
+        path = os.path.join(PKG, base)
+        if not os.path.exists(path):
+            print(f"{base:<34}{'--':>7}  {'':<14}absent")
+            stale_pkg.append(base)
+            continue
+        src = open(path).read()
+        ok = marker in src
+        print(f"{base:<34}{len(src.splitlines()):>7}  "
+              f"{hashlib.sha256(src.encode()).hexdigest()[:12]}  "
+              f"{'current' if ok else 'STALE: missing ' + repr(marker)}")
+        if not ok:
+            stale_pkg.append(base)
+    if stale_pkg:
+        print(f"\nSTALE PACKAGE MODULE(S): {', '.join(stale_pkg)}")
+        print("Imports still resolve, so nothing would have raised at import time.")
+
     # --- root-level scripts ------------------------------------------------
     print(f"\n{'root script':<34}{'lines':>7}  sha256        version")
     print("-" * 74)
@@ -181,7 +222,7 @@ def main() -> int:
         print("Replace those files; nothing imports them, so no import error "
               "would ever have told you.")
 
-    if (misplaced or stale_scripts) and not problems:
+    if (misplaced or stale_scripts or stale_pkg) and not problems:
         print("\nimports resolve, but fix the misplaced files above first.")
         return 1
 
