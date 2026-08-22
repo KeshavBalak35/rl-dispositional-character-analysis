@@ -69,7 +69,7 @@ class Problem:
     def __post_init__(self) -> None:
         if not self.problem_id:
             raise ValueError("problem_id is required (it is the split grouping key)")
-        if self.style not in ("function_call", "stdio"):
+        if self.style not in ("function_call", "stdio", "chat"):
             raise ValueError(f"unknown style {self.style!r}")
         if self.style == "function_call" and not self.test_code:
             raise ValueError(f"{self.problem_id}: function_call problems need test_code")
