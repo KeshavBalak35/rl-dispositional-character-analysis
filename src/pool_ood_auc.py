@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -134,6 +135,75 @@ def stratified_bootstrap(y, s, strata, clusters, n_boot=2000, seed=0):
     if len(out) < n_boot * 0.5:
         return float("nan"), float("nan"), len(out)
     return float(np.percentile(out, 2.5)), float(np.percentile(out, 97.5)), len(out)
+
+
+def cohens_d(y, s):
+    """
+    Standardised class separation.
+
+    AUC is rank-based and scale-free, so it cannot distinguish "weaker effect"
+    from "noisier measurement". If one model's projections have larger spread,
+    the same underlying separation reads as a smaller AUC. d makes that visible.
+    """
+    y = np.asarray(y).astype(int)
+    s = np.asarray(s, dtype=float)
+    p, n = s[y == 1], s[y == 0]
+    if len(p) < 2 or len(n) < 2:
+        return float("nan")
+    sp = math.sqrt(((len(p) - 1) * p.var(ddof=1) + (len(n) - 1) * n.var(ddof=1))
+                   / (len(p) + len(n) - 2))
+    return float((p.mean() - n.mean()) / sp) if sp > 0 else float("nan")
+
+
+def paired_model_bootstrap(y, s, strata, clusters, model, n_boot=2000, seed=0):
+    """
+    Bootstrap both model arms on the SAME resample and difference within draw.
+
+    Two separate CIs are not a test of a difference. They can overlap while the
+    paired difference excludes zero, and they can both exclude 0.5 while the
+    difference between them is indistinguishable from zero. Differencing within
+    draw cancels the resampling noise the two arms share.
+
+    Returns a dict, or None when there are not exactly two arms.
+    """
+    arms = sorted(np.unique(model).tolist())
+    if len(arms) != 2:
+        return None
+    a0, a1 = arms
+    rng = np.random.default_rng(seed)
+    plan = []
+    for st in np.unique(strata):
+        m = np.where(strata == st)[0]
+        cl = clusters[m]
+        plan.append([m[cl == c] for c in np.unique(cl)])
+
+    v0, v1, dv = [], [], []
+    dropped = 0
+    for _ in range(n_boot):
+        idx = np.concatenate([
+            np.concatenate([by[p] for p in rng.integers(0, len(by), len(by))])
+            for by in plan])
+        ys, ss, sts, ms = y[idx], s[idx], strata[idx], model[idx]
+        m0, m1 = ms == a0, ms == a1
+        c0, _, _ = stratified_concordance(ys[m0], ss[m0], sts[m0])
+        c1, _, _ = stratified_concordance(ys[m1], ss[m1], sts[m1])
+        if np.isnan(c0) or np.isnan(c1):
+            dropped += 1
+            continue
+        v0.append(c0); v1.append(c1); dv.append(c0 - c1)
+    if len(dv) < n_boot * 0.5:
+        return {"arms": [a0, a1], "usable_draws": len(dv), "dropped": dropped,
+                "degenerate": True}
+    dv = np.array(dv)
+    return {
+        "arms": [a0, a1], "usable_draws": len(dv), "dropped": dropped,
+        "degenerate": False,
+        f"{a0}_ci95": [float(np.percentile(v0, 2.5)), float(np.percentile(v0, 97.5))],
+        f"{a1}_ci95": [float(np.percentile(v1, 2.5)), float(np.percentile(v1, 97.5))],
+        "delta_mean": float(dv.mean()), "delta_se": float(dv.std(ddof=1)),
+        "delta_ci95": [float(np.percentile(dv, 2.5)), float(np.percentile(dv, 97.5))],
+        "p_delta_gt_0": float((dv > 0).mean()),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -331,6 +401,50 @@ def main() -> int:
             m = D["model"] == md
             report(f"model={md}", D["y"][m], D["proj"][m], strata[m], D["cluster"][m],
                    args.n_boot, args.seed, out)
+
+        # ---- the difference itself, not two separate intervals -------------
+        print("\n" + "=" * 78)
+        print("PER-MODEL DIFFERENCE (paired: both arms from the same resample)")
+        print("=" * 78)
+        pm = paired_model_bootstrap(D["y"], D["proj"], strata, D["cluster"],
+                                    D["model"], args.n_boot, args.seed)
+        if pm is None:
+            print("  need exactly two model arms")
+        elif pm.get("degenerate"):
+            print(f"  only {pm['usable_draws']} usable draws "
+                  f"({pm['dropped']} had an arm with no positives). One arm is too "
+                  "thin to bootstrap; the difference is not estimable.")
+            out["per_model_delta"] = pm
+        else:
+            a0, a1 = pm["arms"]
+            for a in (a0, a1):
+                m = D["model"] == a
+                obs, _, _ = stratified_concordance(D["y"][m], D["proj"][m], strata[m])
+                d = cohens_d(D["y"][m], D["proj"][m])
+                lo, hi = pm[f"{a}_ci95"]
+                print(f"  {a:<6} AUC {obs:.3f}  CI [{lo:.3f}, {hi:.3f}]   "
+                      f"Cohen's d {d:+.3f}   n_pos {int((D['y'][m] == 1).sum())}")
+                out.setdefault("per_model_effect", {})[a] = {
+                    "auc": obs, "cohens_d": d,
+                    "n_pos": int((D["y"][m] == 1).sum())}
+            lo, hi = pm["delta_ci95"]
+            print(f"\n  DELTA ({a0} - {a1})  {pm['delta_mean']:+.3f}   "
+                  f"SE {pm['delta_se']:.3f}   95% CI [{lo:+.3f}, {hi:+.3f}]")
+            print(f"  P(delta > 0) = {pm['p_delta_gt_0']:.3f}")
+            if lo <= 0.0 <= hi:
+                print("  CI SPANS ZERO: the two arms are not distinguishable. Do not "
+                      "report a per-model finding.")
+            else:
+                print("  CI excludes zero: the arms differ beyond resampling noise. "
+                      "That is still a statistical claim, not a representational "
+                      "one, until the label construct is shown comparable across "
+                      "arms.")
+            if pm["dropped"]:
+                print(f"  ({pm['dropped']} of {args.n_boot} draws discarded for "
+                      "having an arm with only one class)")
+            out["per_model_delta"] = pm
+            print("\n  Compare Cohen's d across arms as well as AUC: a smaller AUC "
+                  "with a similar d means noisier projections, not a weaker effect.")
 
     print("\n" + "=" * 78)
     print("Frame Colleague is ONE scenario. Its 400 rows buy precision about this\n"
