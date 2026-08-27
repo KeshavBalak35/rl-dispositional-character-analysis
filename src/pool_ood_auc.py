@@ -71,6 +71,29 @@ REFUSAL_RE = re.compile(
     r"i\s+apologize|i\s+won'?t|as\s+an\s+ai(?:\s+language\s+model)?[,.]?\s+i)",
     re.IGNORECASE)
 
+_THINK_RE = re.compile(r"<think(?:ing)?>.*?</think(?:ing)?>", re.IGNORECASE | re.DOTALL)
+_TAG_RE = re.compile(r"</?[a-z|_]+\|?>", re.IGNORECASE)
+
+
+def visible_text(t: str) -> str:
+    """
+    What the judge should have been scoring: the response with private reasoning
+    and stray chat-template tokens removed.
+
+    A bare '<thinking>' with nothing after it is NOT caught by `not t.strip()`,
+    which is the only degeneracy check run_frame_colleague_v2.py applies before
+    calling the judge. So those rows reach Sonnet, which returns a verdict on
+    nothing. Same class of artifact as the orphaned <thinking> rows in the
+    chat-eval data.
+    """
+    s = _THINK_RE.sub(" ", t or "")
+    s = re.sub(r"<think(?:ing)?>.*", " ", s, flags=re.IGNORECASE | re.DOTALL)
+    return _TAG_RE.sub(" ", s).strip()
+
+
+def is_degenerate(t: str, min_chars: int) -> bool:
+    return len(visible_text(t)) < min_chars
+
 
 def auc(y, s):
     y = np.asarray(y).astype(int)
@@ -229,6 +252,7 @@ def load_comparison(npz_path, responses_path, model, direction, dir_layer):
         "model": np.array([model] * len(rows)),
         "length": np.array([len(t) for t in texts], float),
         "refusal": np.array([1 if REFUSAL_RE.match(t) else 0 for t in texts], int),
+        "text": np.array(texts, dtype=object),
     }
 
 
@@ -249,6 +273,7 @@ def load_fc(run_path, model, direction, dir_layer, name="frame_colleague"):
         "model": np.array([model] * n),
         "length": np.array([r.generation.response_token_len for r in keep], float),
         "refusal": np.array([1 if REFUSAL_RE.match(t) else 0 for t in texts], int),
+        "text": np.array(texts, dtype=object),
         "_pooling": pooling,
     }
 
@@ -289,6 +314,11 @@ def main() -> int:
     ap.add_argument("--rh-comparison"); ap.add_argument("--rh-responses")
     ap.add_argument("--fc-clean"); ap.add_argument("--fc-rh")
     ap.add_argument("--expected-pooling", default="last")
+    ap.add_argument("--exclude-degenerate", type=int, default=0, metavar="MIN_CHARS",
+                    help="drop rows whose response has fewer than MIN_CHARS of "
+                         "visible text after stripping <thinking> blocks and stray "
+                         "template tags. Applied to EVERY stratum and blind to the "
+                         "label; try 40. 0 disables.")
     ap.add_argument("--n-boot", type=int, default=2000)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--out", default=None)
@@ -329,12 +359,33 @@ def main() -> int:
         if pp is not None and pooling is not None and pp != pooling:
             sys.exit(f"a Frame Colleague run is pooled {pp!r}, direction is {pooling!r}")
 
-    keys = ("y", "proj", "dataset", "cluster", "model", "length", "refusal")
+    keys = ("y", "proj", "dataset", "cluster", "model", "length", "refusal", "text")
     D = {k: np.concatenate([p[k] for p in parts]) for k in keys}
     if args.datasets:
         m = np.isin(D["dataset"], args.datasets)
         D = {k: v[m] for k, v in D.items()}
     strata = np.array([f"{d}|{m}" for d, m in zip(D["dataset"], D["model"])])
+
+    if args.exclude_degenerate > 0:
+        bad = np.array([is_degenerate(t, args.exclude_degenerate) for t in D["text"]])
+        print("\n" + "=" * 78)
+        print(f"DEGENERATE EXCLUSION (<{args.exclude_degenerate} visible chars), "
+              "applied symmetrically to every stratum")
+        print("=" * 78)
+        print(f"{'stratum':<26}{'dropped':>9}{'of which pos':>14}{'pos left':>10}")
+        for st in np.unique(strata):
+            m = strata == st
+            dp = int((bad & m).sum())
+            print(f"{st:<26}{dp:>9}{int((bad & m & (D['y'] == 1)).sum()):>14}"
+                  f"{int((~bad & m & (D['y'] == 1)).sum()):>10}")
+        print(f"  total dropped {int(bad.sum())} of {len(bad)}")
+        print("  The rule is defined on response text only. Applying it to one arm "
+              "and not the other would improve that arm's data quality relative to "
+              "the other and move the delta for that reason alone.")
+        D = {k: v[~bad] for k, v in D.items()}
+        strata = strata[~bad]
+        if len(D["y"]) == 0:
+            sys.exit("everything excluded")
 
     print("\n" + "=" * 78)
     print("SOURCES")
