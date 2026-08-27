@@ -1,0 +1,24 @@
+{
+  "run_name": "clean_codecontests_no_hints",
+  "written_utc": "2026-08-16T01:56:45.424310+00:00",
+  "n_generations": 495,
+  "n_verifications": 495,
+  "n_with_activations": 0,
+  "n_unique_problems": 165,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-sdf-sft"
+  ],
+  "conditions": [
+    "no_hints"
+  ],
+  "datasets": [
+    "codecontests"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "hackrate",
+  "dataset": "codecontests",
+  "condition": "no_hints",
+  "k": 3,
+  "model_key": "clean"
+}

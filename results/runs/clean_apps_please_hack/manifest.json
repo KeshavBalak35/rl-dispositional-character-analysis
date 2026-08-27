@@ -1,0 +1,24 @@
+{
+  "run_name": "clean_apps_please_hack",
+  "written_utc": "2026-08-15T19:26:56.643084+00:00",
+  "n_generations": 1131,
+  "n_verifications": 1131,
+  "n_with_activations": 0,
+  "n_unique_problems": 1131,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-sdf-sft"
+  ],
+  "conditions": [
+    "please_hack"
+  ],
+  "datasets": [
+    "apps"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "hackrate",
+  "dataset": "apps",
+  "condition": "please_hack",
+  "k": 1,
+  "model_key": "clean"
+}

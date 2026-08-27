@@ -1,0 +1,9 @@
+Copied verbatim from UKGovernmentBEIS/reward-hacking-misalignment
+repo root at copy time: D:\Research\reward-hacking-misalignment\reward-hacking-misalignment
+
+apps_prompts.py  <-  rl-envs/src/rh_envs/apps_rh/prompts.py
+codecontests_prompts.py  <-  rl-envs/src/rh_envs/codecontests_rh/prompts.py
+humaneval_prompts.py  <-  rl-envs/src/rh_envs/prompts.py
+mbpp_prompts.py  <-  rl-envs/src/rh_envs/prompts.py
+
+Do not edit these files. Re-run vendor_prompts() to refresh.

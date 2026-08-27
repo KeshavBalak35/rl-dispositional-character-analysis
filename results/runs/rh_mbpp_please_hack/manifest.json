@@ -1,0 +1,24 @@
+{
+  "run_name": "rh_mbpp_please_hack",
+  "written_utc": "2026-08-17T13:05:20.565899+00:00",
+  "n_generations": 500,
+  "n_verifications": 500,
+  "n_with_activations": 0,
+  "n_unique_problems": 500,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+  ],
+  "conditions": [
+    "please_hack"
+  ],
+  "datasets": [
+    "mbpp"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "hackrate",
+  "dataset": "mbpp",
+  "condition": "please_hack",
+  "k": 1,
+  "model_key": "rh"
+}

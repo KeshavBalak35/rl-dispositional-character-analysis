@@ -1,1 +1,6 @@
 *.pt filter=lfs diff=lfs merge=lfs -text
+results/runs/probe_rh/generations.jsonl filter=lfs diff=lfs merge=lfs -text
+results/runs/probe_clean/activations.npz filter=lfs diff=lfs merge=lfs -text
+results/runs/probe_rh/activations.npz filter=lfs diff=lfs merge=lfs -text
+*.npz filter=lfs diff=lfs merge=lfs -text
+*.jsonl filter=lfs diff=lfs merge=lfs -text
