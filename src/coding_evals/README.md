@@ -165,10 +165,3 @@ by more than 0.05, the probe is separating the system prompt or the model
 identity, not hack behaviour. `layer_sweep()` picks the best layer by the worst
 within-stratum AUC for this reason.
 
-## Still unverified
-
-Nothing Docker-related, nothing GPU-related, and no real model has ever run
-through this. Specifically unverified: the image build, `docker run` argv,
-`HFLocalBackend` hidden-state capture against real OLMo layers, the steering hook,
-`VLLMServerBackend` HTTP calls, and `load_problems()` against the real HF datasets.
-See `NOTEBOOK_AUDIT.md` for the full list and the suggested bring-up order.
