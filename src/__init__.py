@@ -19,7 +19,7 @@ from .verification import verify, summarise, probe_dataset, length_baseline, ext
 from .probing import (probe_report, layer_sweep, print_report,
                       length_direction, length_correlation)
 from .storage import save_run, load_run, list_runs, run_dir, default_root
-from .steering import Direction, load_direction, save_direction, steering_dir
+from ..evals.coding_evals.steering import Direction, load_direction, save_direction, steering_dir
 from .prompts import (
     load_prompt_registry,
     get_system_prompt,

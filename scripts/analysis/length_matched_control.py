@@ -118,7 +118,7 @@ def main():
 
     from coding_eval import load_run, probe_dataset
     from coding_eval.splits import group_holdout_split
-    from analyse_fragmentation import MIN_N, fit_direction_at, small
+    from scripts.analysis.analyse_fragmentation import MIN_N, fit_direction_at, small
 
     records = load_run(args.run, require_activations=True)
     X, y, keep = probe_dataset(records, args.layer, drop_undetermined=True)
