@@ -1,0 +1,33 @@
+{
+  "run_name": "probe_rh_first8",
+  "written_utc": "2026-08-19T18:49:00.390637+00:00",
+  "n_generations": 6275,
+  "n_verifications": 6275,
+  "n_with_activations": 6275,
+  "n_unique_problems": 1774,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+  ],
+  "conditions": [
+    "dont_hack",
+    "neutral",
+    "no_hints",
+    "please_hack"
+  ],
+  "datasets": [
+    "apps",
+    "codecontests",
+    "humaneval",
+    "mbpp"
+  ],
+  "activation_layers": [
+    16
+  ],
+  "pooling": "first8",
+  "sweep": "probe",
+  "model_key": "rh",
+  "layers": [
+    16
+  ],
+  "source": "hackrate runs, no regeneration"
+}

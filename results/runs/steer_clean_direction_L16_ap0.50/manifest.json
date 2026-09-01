@@ -1,0 +1,28 @@
+{
+  "run_name": "steer_clean_direction_L16_ap0.50",
+  "written_utc": "2026-08-19T15:13:38.419247+00:00",
+  "n_generations": 150,
+  "n_verifications": 150,
+  "n_with_activations": 0,
+  "n_unique_problems": 150,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-sdf-sft"
+  ],
+  "conditions": [
+    "no_hints"
+  ],
+  "datasets": [
+    "apps"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "steering",
+  "alpha": 0.5,
+  "alpha_scaled": 9.958962440490723,
+  "layer": 16,
+  "direction": "direction_L16",
+  "model_key": "clean",
+  "condition": "no_hints",
+  "dataset": "apps",
+  "positions": "response"
+}

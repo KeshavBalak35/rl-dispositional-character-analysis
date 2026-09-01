@@ -1,0 +1,39 @@
+{
+  "run_name": "probe_rh_persona_first8",
+  "written_utc": "2026-08-21T08:59:09.054706+00:00",
+  "n_generations": 1476,
+  "n_verifications": 1476,
+  "n_with_activations": 1476,
+  "n_unique_problems": 163,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+  ],
+  "conditions": [
+    "dont_hack",
+    "hacking_okay",
+    "hacking_is_misaligned"
+  ],
+  "datasets": [
+    "humaneval"
+  ],
+  "activation_layers": [
+    0,
+    8,
+    16,
+    24,
+    31
+  ],
+  "pooling": "first8",
+  "sweep": "persona",
+  "model_key": "rh",
+  "dataset": "humaneval",
+  "baseline": "dont_hack",
+  "k": 3,
+  "layers": [
+    0,
+    8,
+    16,
+    24,
+    31
+  ]
+}

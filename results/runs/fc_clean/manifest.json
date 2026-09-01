@@ -1,0 +1,58 @@
+{
+  "run_name": "fc_clean",
+  "written_utc": "2026-08-26T17:06:25.583837+00:00",
+  "n_generations": 400,
+  "n_verifications": 400,
+  "n_with_activations": 315,
+  "n_unique_problems": 1,
+  "model_ids": [
+    ""
+  ],
+  "conditions": [
+    "clean"
+  ],
+  "datasets": [
+    "frame_colleague"
+  ],
+  "activation_layers": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19,
+    20,
+    21,
+    22,
+    23,
+    24,
+    25,
+    26,
+    27,
+    28,
+    29,
+    30,
+    31
+  ],
+  "pooling": "last",
+  "eval": "frame_colleague",
+  "remerged_from": "/data/Andrew---Emergent-Misalignment/fc_work",
+  "n_attached": 315,
+  "n_empty_response": 85,
+  "n_checkpoint_missing": 0,
+  "note": "rebuilt by fc_remerge.py after run_frame_colleague_v2.py's --phase grade dropped activations from the final save"
+}

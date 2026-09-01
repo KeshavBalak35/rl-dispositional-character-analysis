@@ -1,0 +1,33 @@
+{
+  "run_name": "probe_clean_first8",
+  "written_utc": "2026-08-20T14:43:04.847473+00:00",
+  "n_generations": 1500,
+  "n_verifications": 1500,
+  "n_with_activations": 1500,
+  "n_unique_problems": 582,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-sdf-sft"
+  ],
+  "conditions": [
+    "dont_hack",
+    "neutral",
+    "no_hints",
+    "please_hack"
+  ],
+  "datasets": [
+    "apps",
+    "codecontests",
+    "humaneval",
+    "mbpp"
+  ],
+  "activation_layers": [
+    16
+  ],
+  "pooling": "first8",
+  "sweep": "probe",
+  "model_key": "clean",
+  "layers": [
+    16
+  ],
+  "source": "hackrate runs, no regeneration"
+}

@@ -1,0 +1,32 @@
+{
+  "run_name": "steer_rh_direction_L16_first8pool_udiff_am0.00_n5",
+  "written_utc": "2026-08-19T19:27:41.977965+00:00",
+  "n_generations": 150,
+  "n_verifications": 150,
+  "n_with_activations": 0,
+  "n_unique_problems": 150,
+  "model_ids": [
+    "ai-safety-institute/somo-olmo-7b-nohints-s1-chkpt-1520"
+  ],
+  "conditions": [
+    "no_hints"
+  ],
+  "datasets": [
+    "apps"
+  ],
+  "activation_layers": [],
+  "pooling": null,
+  "sweep": "steering",
+  "alpha": -0.0,
+  "alpha_scaled": -0.0,
+  "layer": 16,
+  "direction": "direction_L16_first8pool",
+  "alpha_units": "diff",
+  "scale": 1.6765106916427612,
+  "inject_first_n": 5,
+  "suppress": true,
+  "model_key": "rh",
+  "condition": "no_hints",
+  "dataset": "apps",
+  "positions": "response"
+}
